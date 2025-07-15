@@ -15,13 +15,20 @@ from datetime import datetime, timedelta
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
-# === Configuration depuis config.py ===
-try:
-    from config import API_ID, API_HASH, BOT_TOKEN, MAX_FILE_SIZE, MESSAGES
-except ImportError:
-    print("❌ Erreur: Le fichier config.py est manquant!")
-    print("Crée un fichier config.py avec tes clés API (voir config_example.py)")
-    sys.exit(1)
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 200 * 1024 * 1024))  # 200 MB par défaut
+
+MESSAGES = {
+    'start': "🤖 Bot PDF Manager prêt à l'emploi!\nEnvoie-moi un PDF pour commencer.",
+    'not_pdf': "❌ Ce n'est pas un fichier PDF !",
+    'file_too_big': "❌ Fichier trop volumineux !",
+    'processing': "⏳ Traitement en cours...",
+    'success_unlock': "✅ PDF déverrouillé avec succès !",
+    'success_pages': "✅ Pages supprimées avec succès !",
+    'error': "❌ Erreur lors du traitement"
+}
 
 try:
     from PyPDF2 import PdfReader, PdfWriter, PageObject
