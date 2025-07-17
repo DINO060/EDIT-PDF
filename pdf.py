@@ -57,7 +57,7 @@ app = Client(
     "pdfbot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=TOKEN
+    bot_token=BOT_TOKEN
 )
 
 def get_user_temp_dir(user_id):
