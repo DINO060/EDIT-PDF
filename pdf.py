@@ -17,13 +17,17 @@ from collections import defaultdict
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 200 * 1024 * 1024))  # 200 MB par défaut
+# Import de la configuration
+try:
+    from config import API_ID, API_HASH, BOT_TOKEN, MAX_FILE_SIZE, MESSAGES as CONFIG_MESSAGES
+except ImportError:
+    print("❌ Fichier config.py manquant!")
+    print("Copie config_example.py vers config.py et configure tes clés API")
+    sys.exit(1)
 MAX_BATCH_FILES = 24
 AUTO_DELETE_DELAY = 300  # 5 minutes
 
+# Messages du bot (peuvent être surchargés par config.py)
 MESSAGES = {
     'start': "🤖 Bot PDF Manager prêt à l'emploi!\n\n📄 **Mode Normal** : Envoie un PDF pour le traiter\n📦 **Mode Batch** : Traite jusqu'à 24 fichiers d'un coup avec `/batch`\n\nEnvoie-moi un PDF pour commencer!",
     'not_pdf': "❌ Ce n'est pas un fichier PDF !",
@@ -33,6 +37,12 @@ MESSAGES = {
     'success_pages': "✅ Pages supprimées avec succès !",
     'error': "❌ Erreur lors du traitement"
 }
+
+# Surcharger avec les messages de config.py s'ils existent
+try:
+    MESSAGES.update(CONFIG_MESSAGES)
+except NameError:
+    pass  # CONFIG_MESSAGES n'existe pas, on garde les messages par défaut
 
 try:
     from PyPDF2 import PdfReader, PdfWriter, PageObject
@@ -52,6 +62,41 @@ user_batches = defaultdict(list)  # {user_id: [docs]}
 TEMP_DIR = Path("temp_files")
 TEMP_DIR.mkdir(exist_ok=True)
 cleanup_task_started = False  # Flag pour éviter de démarrer plusieurs fois la tâche
+
+# Protection globale contre les doublons
+processed_messages = {}
+user_last_command = {}  # {user_id: (command, timestamp)}
+
+def is_duplicate_message(user_id, message_id, command_type="message"):
+    """Vérifie si un message a déjà été traité ou si c'est une commande répétée"""
+    current_time = datetime.now()
+    
+    # Protection contre les commandes répétées (même utilisateur, même commande, < 2 secondes)
+    if command_type in ["start", "batch", "process"]:
+        if user_id in user_last_command:
+            last_cmd, last_time = user_last_command[user_id]
+            if last_cmd == command_type and (current_time - last_time).total_seconds() < 2:
+                logger.info(f"Commande {command_type} ignorée - répétée trop rapidement pour user {user_id}")
+                return True
+        user_last_command[user_id] = (command_type, current_time)
+    
+    # Protection par message_id (pour les messages uniques)
+    key = f"{user_id}_{message_id}"
+    
+    # Nettoyer les anciens messages (plus de 5 minutes)
+    keys_to_remove = []
+    for k, timestamp in processed_messages.items():
+        if (current_time - timestamp).seconds > 300:
+            keys_to_remove.append(k)
+    for k in keys_to_remove:
+        del processed_messages[k]
+    
+    # Vérifier si le message est un doublon
+    if key in processed_messages:
+        return True
+    
+    processed_messages[key] = current_time
+    return False
 
 app = Client(
     "pdfbot",
@@ -103,49 +148,69 @@ def replace_username_in_filename(filename, new_username=None):
     
     return f"{base}{ext}"
 
+async def create_or_edit_status(client, message, text):
+    """Crée ou édite un message de statut selon le contexte"""
+    try:
+        # Si c'est un CallbackQuery, on peut éditer
+        if hasattr(message, 'edit_message_text'):
+            return await message.edit_message_text(text)
+        # Sinon, on crée un nouveau message
+        else:
+            return await client.send_message(message.chat.id, text)
+    except Exception as e:
+        logger.error(f"Erreur création/édition statut: {e}")
+        # En cas d'erreur, envoyer un nouveau message
+        return await client.send_message(
+            message.chat.id if hasattr(message, 'chat') else message.from_user.id, 
+            text
+        )
+
+async def safe_edit_message(message, text):
+    """Édite un message en évitant l'erreur MessageNotModified"""
+    try:
+        await message.edit_message_text(text)
+    except Exception as e:
+        if "MESSAGE_NOT_MODIFIED" in str(e):
+            # Ignorer cette erreur, c'est normal
+            logger.debug(f"Message non modifié (même contenu): {e}")
+        else:
+            logger.error(f"Erreur édition message: {e}")
+            raise e
+
 async def send_and_delete(client, chat_id, file_path, file_name, caption=None, delay_seconds=AUTO_DELETE_DELAY):
     """Envoie un document et le supprime automatiquement après un délai"""
     try:
-        # Envoyer le message explicatif si caption existe
-        if caption:
-            await client.send_message(chat_id, caption)
+        logger.info(f"📤 send_and_delete - Fichier: {file_path} - Existe: {os.path.exists(file_path)}")
+        logger.info(f"📤 send_and_delete - Chat: {chat_id} - Nom: {file_name} - Délai: {delay_seconds}")
         
-        # Envoyer le fichier
         with open(file_path, 'rb') as f:
+            # Ici on ne rajoute pas la phrase de suppression à la caption !
+            sent = await client.send_document(
+                chat_id, 
+                document=f,
+                file_name=file_name,
+                caption=caption or ""
+            )
+            logger.info(f"✅ Document envoyé avec succès - ID: {sent.id}")
+
+            # Planifier la suppression
+            async def delete_after_delay():
+                await asyncio.sleep(delay_seconds)
+                try:
+                    await sent.delete()
+                    logger.info(f"Message supprimé après {delay_seconds}s")
+                except Exception as e:
+                    logger.error(f"Erreur suppression message: {e}")
+                try:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                        logger.info(f"Fichier local supprimé: {file_path}")
+                except Exception as e:
+                    logger.error(f"Erreur suppression fichier: {e}")
+
             if delay_seconds > 0:
-                sent = await client.send_document(
-                    chat_id, 
-                    document=f,
-                    file_name=file_name,
-                    caption=f"⏰ Ce fichier sera supprimé dans {delay_seconds//60} minutes"
-                )
-                
-                # Planifier la suppression
-                async def delete_after_delay():
-                    await asyncio.sleep(delay_seconds)
-                    try:
-                        await sent.delete()
-                        logger.info(f"Message supprimé après {delay_seconds}s")
-                    except Exception as e:
-                        logger.error(f"Erreur suppression message: {e}")
-                    
-                    try:
-                        if os.path.exists(file_path):
-                            os.remove(file_path)
-                            logger.info(f"Fichier local supprimé: {file_path}")
-                    except Exception as e:
-                        logger.error(f"Erreur suppression fichier: {e}")
-                
-                # Lancer la suppression en arrière-plan
                 asyncio.create_task(delete_after_delay())
-            else:
-                # Pas de suppression automatique
-                await client.send_document(
-                    chat_id, 
-                    document=f,
-                    file_name=file_name
-                )
-        
+
     except Exception as e:
         logger.error(f"Erreur send_and_delete: {e}")
 
@@ -153,6 +218,15 @@ async def send_and_delete(client, chat_id, file_path, file_name, caption=None, d
 async def start_handler(client, message: Message):
     global cleanup_task_started
     user_id = message.from_user.id
+    
+    # DEBUG EXPRESS - Vérifier les doubles instances
+    print(f"DEBUG START: Appel handler /start pour user {user_id} à {datetime.now()}")
+    
+    # Protection anti-doublon
+    if is_duplicate_message(user_id, message.id, "start"):
+        logger.info(f"Start ignoré - message dupliqué pour user {user_id}")
+        return
+    
     logger.info(f"Start command received from user {user_id}")
     
     # Démarrer la tâche de nettoyage au premier appel
@@ -161,76 +235,141 @@ async def start_handler(client, message: Message):
         cleanup_task_started = True
         logger.info("Tâche de nettoyage périodique démarrée")
     
-    # Vider le batch et désactiver le mode batch
+    # Réinitialiser complètement la session
+    username = sessions.get(user_id, {}).get('username')
+    delete_delay = sessions.get(user_id, {}).get('delete_delay', AUTO_DELETE_DELAY)
+    
     user_batches[user_id].clear()
-    if user_id in sessions:
-        sessions[user_id]['batch_mode'] = False
+    sessions[user_id] = {}
+    
+    # Restaurer les paramètres
+    if username:
+        sessions[user_id]['username'] = username
+    if delete_delay != AUTO_DELETE_DELAY:
+        sessions[user_id]['delete_delay'] = delete_delay
     
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("⚙️ Paramètre", callback_data="settings")],
         [InlineKeyboardButton("📦 Mode Batch", callback_data="batch_mode")]
     ])
-    await message.reply_text(MESSAGES['start'], reply_markup=keyboard)
+    
+    await client.send_message(message.chat.id, MESSAGES['start'], reply_markup=keyboard)
 
 @app.on_message(filters.command("batch") & filters.private)
 async def batch_command(client, message: Message):
     user_id = message.from_user.id
+    
+    # Protection anti-doublon
+    if is_duplicate_message(user_id, message.id, "batch"):
+        logger.info(f"Batch ignoré - message dupliqué pour user {user_id}")
+        return
+    
+    logger.info(f"🔍 batch_command appelé - User {user_id} - Time: {datetime.now()}")
+    
+    # Protection contre les doubles appels
+    if sessions.get(user_id, {}).get('batch_command_processing'):
+        logger.info(f"🔍 batch_command ignoré - déjà en cours pour user {user_id}")
+        return
+    
+    sessions[user_id] = sessions.get(user_id, {})
+    sessions[user_id]['batch_command_processing'] = True
+    
     count = len(user_batches[user_id])
     if count > 0:
-        await message.reply_text(
+        await client.send_message(
+            message.chat.id,
             f"📦 **Mode Batch**\n\n"
             f"Tu as {count} fichier(s) en attente.\n"
             f"Maximum: {MAX_BATCH_FILES} fichiers\n\n"
             f"Envoie `/process` pour traiter tous les fichiers"
         )
     else:
-        await message.reply_text(
+        await client.send_message(
+            message.chat.id,
             f"📦 **Mode Batch**\n\n"
             f"Aucun fichier en attente.\n"
             f"Envoie jusqu'à {MAX_BATCH_FILES} fichiers PDF puis `/process`"
         )
+    
+    # Libérer le flag
+    sessions[user_id]['batch_command_processing'] = False
 
 @app.on_message(filters.command("process") & filters.private)
 async def process_batch_command(client, message: Message):
     user_id = message.from_user.id
+    
+    # Protection anti-doublon
+    if is_duplicate_message(user_id, message.id, "process"):
+        logger.info(f"Process ignoré - message dupliqué pour user {user_id}")
+        return
+    
+    logger.info(f"🔍 process_batch_command appelé - User {user_id} - Time: {datetime.now()}")
+    
+    # Protection contre les doubles appels
+    if sessions.get(user_id, {}).get('process_command_processing'):
+        logger.info(f"🔍 process_batch_command ignoré - déjà en cours pour user {user_id}")
+        return
+    
+    sessions[user_id] = sessions.get(user_id, {})
+    sessions[user_id]['process_command_processing'] = True
+    
     if not user_batches[user_id]:
-        await message.reply_text("❌ Aucun fichier en attente dans le batch")
+        await client.send_message(message.chat.id, "❌ Aucun fichier en attente dans le batch")
+        sessions[user_id]['process_command_processing'] = False
         return
     
     keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧹 Nettoyer usernames (tous)", callback_data=f"batch_clean:{user_id}")],
         [InlineKeyboardButton("🔓 Déverrouiller tous", callback_data=f"batch_unlock:{user_id}")],
         [InlineKeyboardButton("🗑️ Supprimer pages (tous)", callback_data=f"batch_pages:{user_id}")],
         [InlineKeyboardButton("🛠️ The Both (tous)", callback_data=f"batch_both:{user_id}")],
         [InlineKeyboardButton("🧹 Vider le batch", callback_data=f"batch_clear:{user_id}")]
     ])
     
-    await message.reply_text(
+    await client.send_message(
+        message.chat.id,
         f"📦 **Traitement Batch**\n\n"
         f"{len(user_batches[user_id])} fichier(s) prêt(s)\n\n"
         f"Que veux-tu faire?",
         reply_markup=keyboard
     )
+    
+    # Libérer le flag
+    sessions[user_id]['process_command_processing'] = False
 
 @app.on_message(filters.document & filters.private)
 async def handle_document(client, message: Message):
+    user_id = message.from_user.id
+    
+    # Protection anti-doublon
+    if is_duplicate_message(user_id, message.id, "document"):
+        logger.info(f"Document ignoré - message dupliqué pour user {user_id}")
+        return
+    
+    # Vérifier si on traite déjà quelque chose
+    if sessions.get(user_id, {}).get('processing'):
+        logger.info(f"Document ignoré - traitement en cours pour user {user_id}")
+        return
+    
     doc = message.document
     if not doc:
         return
+    
     if doc.mime_type != "application/pdf":
-        await message.reply_text(MESSAGES['not_pdf'])
-        return
-    if doc.file_size > MAX_FILE_SIZE:
-        await message.reply_text(MESSAGES['file_too_big'])
+        await client.send_message(message.chat.id, MESSAGES['not_pdf'])
         return
     
-    user_id = message.from_user.id
+    if doc.file_size > MAX_FILE_SIZE:
+        await client.send_message(message.chat.id, MESSAGES['file_too_big'])
+        return
+    
     file_id = doc.file_id
     file_name = doc.file_name or "document.pdf"
     
     # Vérifier si on est en mode batch
     if sessions.get(user_id, {}).get('batch_mode'):
         if len(user_batches[user_id]) >= MAX_BATCH_FILES:
-            await message.reply_text(f"❌ Limite de {MAX_BATCH_FILES} fichiers atteinte!")
+            await client.send_message(message.chat.id, f"❌ Limite de {MAX_BATCH_FILES} fichiers atteinte!")
             return
         
         user_batches[user_id].append({
@@ -238,40 +377,68 @@ async def handle_document(client, message: Message):
             'file_name': file_name
         })
         
-        await message.reply_text(
+        await client.send_message(
+            message.chat.id,
             f"✅ Fichier ajouté au batch ({len(user_batches[user_id])}/{MAX_BATCH_FILES})\n\n"
             f"Envoie `/process` quand tu as fini d'ajouter des fichiers"
         )
         return
     
-    # Mode normal (fichier unique)
-    sessions[user_id] = sessions.get(user_id, {})
-    sessions[user_id].update({
+    # Mode normal - créer une nouvelle session
+    if user_id not in sessions:
+        sessions[user_id] = {}
+    
+    # Conserver username et delete_delay
+    username = sessions[user_id].get('username')
+    delete_delay = sessions[user_id].get('delete_delay', AUTO_DELETE_DELAY)
+    
+    sessions[user_id] = {
         'file_id': file_id,
         'file_name': file_name,
         'last_activity': datetime.now()
-    })
+    }
+    
+    # Restaurer les paramètres
+    if username:
+        sessions[user_id]['username'] = username
+    if delete_delay != AUTO_DELETE_DELAY:
+        sessions[user_id]['delete_delay'] = delete_delay
     
     keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧹 Nettoyer usernames", callback_data=f"clean_username:{user_id}")],
         [InlineKeyboardButton("🔓 Déverrouiller", callback_data=f"unlock:{user_id}")],
         [InlineKeyboardButton("🗑️ Supprimer des pages", callback_data=f"pages:{user_id}")],
         [InlineKeyboardButton("🛠️ The Both", callback_data=f"both:{user_id}")],
         [InlineKeyboardButton("❌ Annuler", callback_data=f"cancel:{user_id}")]
     ])
     
-    await message.reply_text(
+    await client.send_message(
+        message.chat.id,
         f"Fichier reçu: {file_name}\n\nQue veux-tu faire?",
         reply_markup=keyboard
     )
 
 @app.on_callback_query()
 async def button_callback(client, query: CallbackQuery):
+    await query.answer()
+    
     data = query.data
+    user_id = query.from_user.id
+    
+    if user_id not in sessions:
+        sessions[user_id] = {}
+    
+    # Vérifier si une action est déjà en cours (sauf pour clean_username)
+    if sessions[user_id].get('processing') and not data.startswith("clean_username"):
+        await query.answer("⏳ Traitement déjà en cours...", show_alert=True)
+        return
+    
+    # NE PAS marquer processing=True pour clean_username
+    if not data.startswith("clean_username") and not data.startswith("cancel"):
+        sessions[user_id]['processing'] = True
     
     # Gestion du mode batch
     if data == "batch_mode":
-        user_id = query.from_user.id
-        sessions[user_id] = sessions.get(user_id, {})
         sessions[user_id]['batch_mode'] = True
         
         await query.edit_message_text(
@@ -280,6 +447,7 @@ async def button_callback(client, query: CallbackQuery):
             f"Quand tu as fini, envoie `/process` pour les traiter.\n\n"
             f"Pour désactiver le mode batch, envoie `/start`"
         )
+        sessions[user_id]['processing'] = False
         return
     
     # Gestion batch clear
@@ -287,6 +455,7 @@ async def button_callback(client, query: CallbackQuery):
         user_id = int(data.split(":")[1])
         user_batches[user_id].clear()
         await query.edit_message_text("🧹 Batch vidé avec succès!")
+        sessions[user_id]['processing'] = False
         return
     
     # Gestion des actions batch
@@ -294,7 +463,10 @@ async def button_callback(client, query: CallbackQuery):
         action, user_id = data.split(":")
         user_id = int(user_id)
         
-        if action == "batch_unlock":
+        if action == "batch_clean":
+            await process_batch_clean(client, query.message, user_id)
+            return
+        elif action == "batch_unlock":
             sessions[user_id] = sessions.get(user_id, {})
             sessions[user_id]['batch_action'] = 'unlock'
             sessions[user_id]['awaiting_batch_password'] = True
@@ -319,6 +491,52 @@ async def button_callback(client, query: CallbackQuery):
                 "🛠️ **The Both - Batch**\n\n"
                 "Étape 1/2: Envoie-moi le mot de passe (ou 'none'):"
             )
+        elif action == "batch_both_first":
+            password = sessions[user_id].get('batch_both_password', '')
+            if password:
+                await process_batch_both(client, query.message, password, "1")
+            else:
+                await query.edit_message_text("❌ Erreur: mot de passe manquant")
+        elif action == "batch_both_last":
+            password = sessions[user_id].get('batch_both_password', '')
+            if password:
+                files = user_batches[user_id]
+                if files:
+                    file = await client.download_media(files[0]['file_id'], file_name=f"{get_user_temp_dir(user_id)}/temp.pdf")
+                    with open(file, 'rb') as f:
+                        reader = PdfReader(f)
+                        total_pages = len(reader.pages)
+                    os.remove(file)
+                    await process_batch_both(client, query.message, password, str(total_pages))
+                else:
+                    await query.edit_message_text("❌ Aucun fichier dans le batch")
+            else:
+                await query.edit_message_text("❌ Erreur: mot de passe manquant")
+        elif action == "batch_both_middle":
+            password = sessions[user_id].get('batch_both_password', '')
+            if password:
+                files = user_batches[user_id]
+                if files:
+                    file = await client.download_media(files[0]['file_id'], file_name=f"{get_user_temp_dir(user_id)}/temp.pdf")
+                    with open(file, 'rb') as f:
+                        reader = PdfReader(f)
+                        total_pages = len(reader.pages)
+                    middle = total_pages // 2 if total_pages % 2 == 0 else (total_pages // 2) + 1
+                    os.remove(file)
+                    await process_batch_both(client, query.message, password, str(middle))
+                else:
+                    await query.edit_message_text("❌ Aucun fichier dans le batch")
+            else:
+                await query.edit_message_text("❌ Erreur: mot de passe manquant")
+        elif action == "batch_both_manual":
+            sessions[user_id]['awaiting_batch_both_pages'] = True
+            await query.edit_message_text(
+                "📝 **Saisie manuelle des pages - Batch**\n\n"
+                "Envoie-moi les pages à supprimer au format :\n"
+                "• 1 → supprime page 1\n"
+                "• 1,3,5 → supprime pages 1, 3 et 5\n"
+                "• 1-5 → supprime pages 1 à 5"
+            )
         return
     
     # Gestion des paramètres
@@ -333,6 +551,7 @@ async def button_callback(client, query: CallbackQuery):
             "Configure ton bot selon tes besoins.",
             reply_markup=keyboard
         )
+        sessions[user_id]['processing'] = False
         return
     
     elif data == "set_delete_delay":
@@ -417,13 +636,26 @@ async def button_callback(client, query: CallbackQuery):
         await query.edit_message_text(MESSAGES['start'], reply_markup=keyboard)
         return
     
-    # Gestion des actions PDF (suite du code original)
+    # Gestion des actions PDF
     if ":" not in data:
+        sessions[user_id]['processing'] = False
         return
     
     action, user_id = data.split(":")
     user_id = int(user_id)
     
+    # CORRECTION 1: Pour clean_username, marquer un flag spécial
+    if action == "clean_username":
+        if user_id not in sessions:
+            sessions[user_id] = {}
+        sessions[user_id]['cleaning_only'] = True
+        # S'assurer que la session contient les données nécessaires
+        if 'file_id' not in sessions[user_id]:
+            await query.edit_message_text("❌ Aucun fichier en session. Envoie un PDF d'abord.")
+            sessions[user_id]['processing'] = False
+            return
+        await process_clean_username(client, query.message, sessions[user_id])
+        return
     if action == "cancel":
         sessions.pop(user_id, None)
         await query.edit_message_text("❌ Opération annulée")
@@ -431,6 +663,7 @@ async def button_callback(client, query: CallbackQuery):
     
     if user_id not in sessions:
         await query.edit_message_text("❌ Session expirée. Renvoie le PDF.")
+        sessions[user_id]['processing'] = False
         return
     
     sessions[user_id]['action'] = action
@@ -523,15 +756,36 @@ async def handle_all_text(client, message: Message):
         password = message.text.strip()
         session['batch_both_password'] = password
         session['awaiting_batch_both_password'] = False
-        await message.reply_text(
+        
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("The first", callback_data=f"batch_both_first:{user_id}"),
+                InlineKeyboardButton("The last", callback_data=f"batch_both_last:{user_id}"),
+                InlineKeyboardButton("The middle", callback_data=f"batch_both_middle:{user_id}")
+            ],
+            [InlineKeyboardButton("📝 Saisir manuellement", callback_data=f"batch_both_manual:{user_id}")]
+        ])
+        await client.send_message(
+            message.chat.id,
             "✅ Mot de passe reçu!\n\n"
-            "**Étape 2/2:** Quelles pages supprimer? (ex: 1,3,5 ou 1-5)"
+            "**Étape 2/2:** Choisis les pages à supprimer :",
+            reply_markup=keyboard
         )
         return
     
     if session.get('batch_action') == 'both' and session.get('batch_both_password'):
         pages_text = message.text.strip()
         await process_batch_both(client, message, session['batch_both_password'], pages_text)
+        return
+    
+    # Gestion de la saisie manuelle des pages pour batch both
+    if session.get('awaiting_batch_both_pages'):
+        pages_text = message.text.strip()
+        password = session.get('batch_both_password', '')
+        if password:
+            await process_batch_both(client, message, password, pages_text)
+        else:
+            await client.send_message(message.chat.id, "❌ Erreur: mot de passe manquant")
         return
 
     # Gestion username (paramètre)
@@ -541,10 +795,10 @@ async def handle_all_text(client, message: Message):
         if match:
             session['username'] = match.group()
             session['awaiting_username'] = False
-            await message.reply_text(f"✅ Username sauvegardé : {session['username']}")
+            await client.send_message(message.chat.id, f"✅ Username sauvegardé : {session['username']}")
             logger.info(f"🔧 Username enregistré pour user {user_id}: {session['username']}")
         else:
-            await message.reply_text("❌ Aucun @username valide trouvé dans ton texte. Réessaie.")
+            await client.send_message(message.chat.id, "❌ Aucun @username valide trouvé dans ton texte. Réessaie.")
         return
 
     # Gestion de The Both - saisie manuelle des pages
@@ -553,7 +807,8 @@ async def handle_all_text(client, message: Message):
         session['both_pages'] = pages_text
         session['awaiting_both_pages'] = False
         session['awaiting_both_password'] = True
-        await message.reply_text(
+        await client.send_message(
+            message.chat.id,
             f"✅ Pages sélectionnées : {pages_text}\n\n"
             "**Étape 1/2 :** Envoie-moi le mot de passe du PDF (ou 'none' si non protégé):"
         )
@@ -591,10 +846,17 @@ async def process_batch_unlock(client, message, password):
     files = user_batches[user_id]
     
     if not files:
-        await message.reply_text("❌ Aucun fichier dans le batch")
+        # Utiliser edit_message_text au lieu de send_message
+        if hasattr(message, 'edit_message_text'):
+            await message.edit_message_text("❌ Aucun fichier dans le batch")
+        else:
+            await client.send_message(message.chat.id, "❌ Aucun fichier dans le batch")
+        sessions[user_id]['processing'] = False
         return
     
-    status = await message.reply_text(f"⏳ Traitement de {len(files)} fichiers...")
+    # Utiliser la fonction helper pour créer le message de statut
+    logger.info(f"🔍 Début process_batch_unlock - User {user_id} - Time: {datetime.now()}")
+    status = await create_or_edit_status(client, message, f"⏳ Traitement de {len(files)} fichiers...")
     success_count = 0
     error_count = 0
     
@@ -628,11 +890,7 @@ async def process_batch_unlock(client, message, password):
                 new_file_name = replace_username_in_filename(file_info['file_name'], username)
                 delay = sessions[user_id].get('delete_delay', AUTO_DELETE_DELAY)
                 
-                if delay > 0:
-                    await send_and_delete(client, message.chat.id, output_path, new_file_name, delay_seconds=delay)
-                else:
-                    with open(output_path, 'rb') as f:
-                        await client.send_document(message.chat.id, document=f, file_name=new_file_name)
+                await send_and_delete(client, message.chat.id, output_path, new_file_name, delay_seconds=delay)
                 
                 success_count += 1
                 
@@ -648,13 +906,19 @@ async def process_batch_unlock(client, message, password):
     
     user_batches[user_id].clear()
     sessions[user_id]['awaiting_batch_password'] = False
+    # Libérer le flag de traitement
+    sessions[user_id]['processing'] = False
 
 async def process_batch_pages(client, message, pages_text):
     user_id = message.from_user.id
     files = user_batches[user_id]
     
     if not files:
-        await message.reply_text("❌ Aucun fichier dans le batch")
+        if hasattr(message, 'edit_message_text'):
+            await message.edit_message_text("❌ Aucun fichier dans le batch")
+        else:
+            await client.send_message(message.chat.id, "❌ Aucun fichier dans le batch")
+        sessions[user_id]['processing'] = False
         return
     
     # Parser les pages
@@ -667,10 +931,16 @@ async def process_batch_pages(client, message, pages_text):
             else:
                 pages_to_remove.add(int(part))
     except ValueError:
-        await message.reply_text("❌ Format invalide. Utilise: 1,3,5 ou 1-5")
+        if hasattr(message, 'edit_message_text'):
+            await message.edit_message_text("❌ Format invalide. Utilise: 1,3,5 ou 1-5")
+        else:
+            await client.send_message(message.chat.id, "❌ Format invalide. Utilise: 1,3,5 ou 1-5")
+        sessions[user_id]['processing'] = False
         return
     
-    status = await message.reply_text(f"⏳ Traitement de {len(files)} fichiers...")
+    # Utiliser la fonction helper
+    logger.info(f"🔍 Début process_batch_pages - User {user_id} - Time: {datetime.now()}")
+    status = await create_or_edit_status(client, message, f"⏳ Traitement de {len(files)} fichiers...")
     success_count = 0
     error_count = 0
     
@@ -708,11 +978,7 @@ async def process_batch_pages(client, message, pages_text):
                 new_file_name = replace_username_in_filename(file_info['file_name'], username)
                 delay = sessions[user_id].get('delete_delay', AUTO_DELETE_DELAY)
                 
-                if delay > 0:
-                    await send_and_delete(client, message.chat.id, output_path, new_file_name, delay_seconds=delay)
-                else:
-                    with open(output_path, 'rb') as f:
-                        await client.send_document(message.chat.id, document=f, file_name=new_file_name)
+                await send_and_delete(client, message.chat.id, output_path, new_file_name, delay_seconds=delay)
                 
                 success_count += 1
                 
@@ -728,13 +994,19 @@ async def process_batch_pages(client, message, pages_text):
     
     user_batches[user_id].clear()
     sessions[user_id]['batch_action'] = None
+    # Libérer le flag de traitement
+    sessions[user_id]['processing'] = False
 
 async def process_batch_both(client, message, password, pages_text):
     user_id = message.from_user.id
     files = user_batches[user_id]
     
     if not files:
-        await message.reply_text("❌ Aucun fichier dans le batch")
+        if hasattr(message, 'edit_message_text'):
+            await message.edit_message_text("❌ Aucun fichier dans le batch")
+        else:
+            await client.send_message(message.chat.id, "❌ Aucun fichier dans le batch")
+        sessions[user_id]['processing'] = False
         return
     
     # Parser les pages
@@ -747,10 +1019,16 @@ async def process_batch_both(client, message, password, pages_text):
             else:
                 pages_to_remove.add(int(part))
     except ValueError:
-        await message.reply_text("❌ Format invalide. Utilise: 1,3,5 ou 1-5")
+        if hasattr(message, 'edit_message_text'):
+            await message.edit_message_text("❌ Format invalide. Utilise: 1,3,5 ou 1-5")
+        else:
+            await client.send_message(message.chat.id, "❌ Format invalide. Utilise: 1,3,5 ou 1-5")
+        sessions[user_id]['processing'] = False
         return
     
-    status = await message.reply_text(f"⏳ Traitement combiné de {len(files)} fichiers...")
+    # Utiliser la fonction helper
+    logger.info(f"🔍 Début process_batch_both - User {user_id} - Time: {datetime.now()}")
+    status = await create_or_edit_status(client, message, f"⏳ Traitement combiné de {len(files)} fichiers...")
     success_count = 0
     error_count = 0
     
@@ -793,11 +1071,7 @@ async def process_batch_both(client, message, password, pages_text):
                 new_file_name = replace_username_in_filename(file_info['file_name'], username)
                 delay = sessions[user_id].get('delete_delay', AUTO_DELETE_DELAY)
                 
-                if delay > 0:
-                    await send_and_delete(client, message.chat.id, output_path, new_file_name, delay_seconds=delay)
-                else:
-                    with open(output_path, 'rb') as f:
-                        await client.send_document(message.chat.id, document=f, file_name=new_file_name)
+                await send_and_delete(client, message.chat.id, output_path, new_file_name, delay_seconds=delay)
                 
                 success_count += 1
                 
@@ -814,6 +1088,8 @@ async def process_batch_both(client, message, password, pages_text):
     user_batches[user_id].clear()
     sessions[user_id]['batch_action'] = None
     sessions[user_id]['batch_both_password'] = None
+    # Libérer le flag de traitement
+    sessions[user_id]['processing'] = False
 
 # Modification des fonctions existantes pour utiliser send_and_delete
 async def process_unlock(client, message, session, password):
@@ -821,8 +1097,12 @@ async def process_unlock(client, message, session, password):
         await message.delete()
     except:
         pass
+    
     user_id = message.from_user.id
+    logger.info(f"🔓 process_unlock - User {user_id} - Password length: {len(password)}")
+    
     status = await client.send_message(message.chat.id, MESSAGES['processing'])
+    
     try:
         file = await client.download_media(session['file_id'], file_name=f"{get_user_temp_dir(user_id)}/input.pdf")
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -831,17 +1111,39 @@ async def process_unlock(client, message, session, password):
             os.rename(file, input_path)
             with open(input_path, 'rb') as f:
                 reader = PdfReader(f)
-                if not reader.is_encrypted:
-                    await status.edit_text("ℹ️ Ce PDF n'est pas protégé")
-                    return
-                if not reader.decrypt(password):
-                    await status.edit_text("❌ Mot de passe incorrect")
-                    return
-                writer = PdfWriter()
-                username = session.get('username', '')
+                logger.info(f"🔓 PDF encrypted: {reader.is_encrypted}")
                 
+                if not reader.is_encrypted:
+                    # PDF non protégé
+                    username = session.get('username', '')
+                    cleaned_name = replace_username_in_filename(session['file_name'], username)
+                    await status.delete()
+                    
+                    # D'abord envoyer le message
+                    await client.send_message(
+                        message.chat.id,
+                        "ℹ️ Ce PDF n'était pas protégé.\n\n✅ Usernames nettoyés dans le nom du fichier !"
+                    )
+                    
+                    # Puis envoyer le fichier
+                    delay = session.get('delete_delay', AUTO_DELETE_DELAY)
+                    await send_and_delete(client, message.chat.id, input_path, cleaned_name, delay_seconds=delay)
+                    
+                    # IMPORTANT: Supprimer la session pour éviter les doubles
+                    sessions.pop(user_id, None)
+                    return
+                
+                # Tenter de déverrouiller
+                decrypt_result = reader.decrypt(password)
+                logger.info(f"🔓 Decrypt result: {decrypt_result}")
+                
+                if not decrypt_result:
+                    await status.edit_text("❌ Mot de passe incorrect")
+                    # Ne pas supprimer la session ici pour permettre de réessayer
+                    return
+                
+                writer = PdfWriter()
                 for page in reader.pages:
-                    cleaned_text = extract_and_clean_pdf_text(page)
                     writer.add_page(page)
                 
                 with open(output_path, 'wb') as out:
@@ -849,31 +1151,33 @@ async def process_unlock(client, message, session, password):
                     
             await status.delete()
             
-            caption = MESSAGES['success_unlock']
-            if username:
-                caption += f"\n\nUsername ajouté: {username}"
+            # D'abord envoyer le message de succès
+            await client.send_message(message.chat.id, MESSAGES['success_unlock'])
+            logger.info(f"✅ Message de succès envoyé pour user {user_id}")
             
-            username = session.get('username')
+            # Préparer le nom du fichier
+            username = session.get('username', '')
             new_file_name = replace_username_in_filename(session['file_name'], username)
+            logger.info(f"📁 Nom du fichier préparé: {new_file_name}")
             
-            # Utiliser send_and_delete avec le délai personnalisé
+            # Envoyer le fichier
             delay = session.get('delete_delay', AUTO_DELETE_DELAY)
-            if delay > 0:
-                await send_and_delete(client, message.chat.id, output_path, new_file_name, caption, delay)
-            else:
-                await client.send_message(message.chat.id, caption)
-                with open(output_path, 'rb') as f:
-                    await client.send_document(message.chat.id, document=f, file_name=new_file_name)
+            logger.info(f"📤 Tentative d'envoi du fichier - Délai: {delay}")
+            await send_and_delete(client, message.chat.id, output_path, new_file_name, delay_seconds=delay)
+            
+            # IMPORTANT: Supprimer la session après succès
+            sessions.pop(user_id, None)
                 
     except Exception as e:
-        logger.error(f"Erreur unlock: {e}")
+        logger.error(f"❌ Erreur unlock: {e}")
+        logger.exception("Traceback complet:")
         await status.edit_text(MESSAGES['error'])
-    finally:
-        sessions.pop(message.from_user.id, None)
+        # Supprimer la session en cas d'erreur
+        sessions.pop(user_id, None)
 
 async def process_pages(client, message, session, pages_text):
     user_id = message.from_user.id
-    status = await message.reply_text(MESSAGES['processing'])
+    status = await client.send_message(message.chat.id, MESSAGES['processing'])
     pages_to_remove = set()
     
     try:
@@ -921,7 +1225,15 @@ async def process_pages(client, message, session, pages_text):
                         kept += 1
                         
                 if kept == 0:
-                    await status.edit_text("❌ Tu ne peux pas supprimer toutes les pages!")
+                    # Aucune page supprimée : republie en nettoyant le nom du fichier
+                    username = session.get('username', '')
+                    cleaned_name = replace_username_in_filename(session['file_name'], username)
+                    await status.delete()
+                    caption = "ℹ️ Aucune page n'a été supprimée.\n\n✅ Usernames nettoyés dans le nom du fichier !"
+                    if username:
+                        caption += f"\n\nUsername ajouté: {username}"
+                    delay = session.get('delete_delay', AUTO_DELETE_DELAY)
+                    await send_and_delete(client, message.chat.id, input_path, cleaned_name, caption, delay)
                     return
                     
                 with open(output_path, 'wb') as out:
@@ -930,20 +1242,15 @@ async def process_pages(client, message, session, pages_text):
             await status.delete()
             
             caption = f"{MESSAGES['success_pages']}\n\nPages supprimées: {sorted(pages_to_remove)}"
+            username = session.get('username', '')
             if username:
                 caption += f"\n\nUsername ajouté: {username}"
             
-            username = session.get('username')
             new_file_name = replace_username_in_filename(session['file_name'], username)
             
             # Utiliser send_and_delete avec le délai personnalisé
             delay = session.get('delete_delay', AUTO_DELETE_DELAY)
-            if delay > 0:
-                await send_and_delete(client, message.chat.id, output_path, new_file_name, caption, delay)
-            else:
-                await client.send_message(message.chat.id, caption)
-                with open(output_path, 'rb') as f:
-                    await client.send_document(message.chat.id, document=f, file_name=new_file_name)
+            await send_and_delete(client, message.chat.id, output_path, new_file_name, caption, delay)
                     
     except Exception as e:
         logger.error(f"Erreur pages: {e}")
@@ -975,7 +1282,8 @@ async def process_both_password_received(client, message, session, password):
         session['awaiting_both_password'] = False
         session['awaiting_both_pages_selection'] = True
         
-        await message.reply_text(
+        await client.send_message(
+            message.chat.id,
             "✅ Mot de passe reçu!\n\n"
             "**Étape 2/2 :** Choisis les pages à supprimer:",
             reply_markup=keyboard
@@ -1050,6 +1358,17 @@ async def process_both_final(client, message, session, password, pages_text):
                     if not reader.decrypt(password):
                         await status.edit_text("❌ Mot de passe incorrect")
                         return
+                else:
+                    # PDF n'est pas protégé : republier en nettoyant le nom du fichier
+                    username = session.get('username', '')
+                    cleaned_name = replace_username_in_filename(session['file_name'], username)
+                    await status.delete()
+                    caption = "ℹ️ Ce PDF n'était pas protégé.\n\n✅ Usernames nettoyés dans le nom du fichier !"
+                    if username:
+                        caption += f"\n\nUsername ajouté: {username}"
+                    delay = session.get('delete_delay', AUTO_DELETE_DELAY)
+                    await send_and_delete(client, message.chat.id, input_path, cleaned_name, caption, delay)
+                    return
                 
                 total_pages = len(reader.pages)
                 invalid = [p for p in pages_to_remove if p < 1 or p > total_pages]
@@ -1072,7 +1391,15 @@ async def process_both_final(client, message, session, password, pages_text):
                         kept += 1
                 
                 if kept == 0:
-                    await status.edit_text("❌ Tu ne peux pas supprimer toutes les pages!")
+                    # Aucune page supprimée : republier en nettoyant le nom du fichier
+                    username = session.get('username', '')
+                    cleaned_name = replace_username_in_filename(session['file_name'], username)
+                    await status.delete()
+                    caption = "ℹ️ Aucune page n'a été supprimée.\n\n✅ Usernames nettoyés dans le nom du fichier !"
+                    if username:
+                        caption += f"\n\nUsername ajouté: {username}"
+                    delay = session.get('delete_delay', AUTO_DELETE_DELAY)
+                    await send_and_delete(client, message.chat.id, input_path, cleaned_name, caption, delay)
                     return
                 
                 with open(output_path, 'wb') as out:
@@ -1081,6 +1408,7 @@ async def process_both_final(client, message, session, password, pages_text):
             await status.delete()
             
             caption = "✅ **The Both** - Traitement combiné terminé!\n\n"
+            username = session.get('username', '')
             if username:
                 caption += f"Username ajouté: {username}\n"
             caption += f"Pages supprimées: {sorted(pages_to_remove)}\n"
@@ -1089,17 +1417,11 @@ async def process_both_final(client, message, session, password, pages_text):
             caption += "• Nettoyage automatique des @username et hashtags\n"
             caption += "• Username personnalisé ajouté"
             
-            username = session.get('username')
             new_file_name = replace_username_in_filename(session['file_name'], username)
             
             # Utiliser send_and_delete avec le délai personnalisé
             delay = session.get('delete_delay', AUTO_DELETE_DELAY)
-            if delay > 0:
-                await send_and_delete(client, message.chat.id, output_path, new_file_name, caption, delay)
-            else:
-                await client.send_message(message.chat.id, caption)
-                with open(output_path, 'rb') as f:
-                    await client.send_document(message.chat.id, document=f, file_name=new_file_name)
+            await send_and_delete(client, message.chat.id, output_path, new_file_name, caption, delay)
                     
     except Exception as e:
         logger.error(f"Erreur both final: {e}")
@@ -1146,27 +1468,30 @@ async def process_pages_with_password(client, message, session, password, pages_
                         writer.add_page(page)
                         kept += 1
                 if kept == 0:
-                    await status.edit_text("❌ Tu ne peux pas supprimer toutes les pages!")
+                    # Aucune page supprimée : republier en nettoyant le nom du fichier
+                    username = session.get('username', '')
+                    cleaned_name = replace_username_in_filename(session['file_name'], username)
+                    await status.delete()
+                    caption = "ℹ️ Aucune page n'a été supprimée.\n\n✅ Usernames nettoyés dans le nom du fichier !"
+                    if username:
+                        caption += f"\n\nUsername ajouté: {username}"
+                    delay = session.get('delete_delay', AUTO_DELETE_DELAY)
+                    await send_and_delete(client, message.chat.id, input_path, cleaned_name, caption, delay)
                     return
                 with open(output_path, 'wb') as out:
                     writer.write(out)
             await status.delete()
             
             caption = f"{MESSAGES['success_pages']}\n\nPages supprimées: {sorted(pages_to_remove)}"
+            username = session.get('username', '')
             if username:
                 caption += f"\n\nUsername ajouté: {username}"
             
-            username = session.get('username')
             new_file_name = replace_username_in_filename(session['file_name'], username)
             
             # Utiliser send_and_delete avec le délai personnalisé
             delay = session.get('delete_delay', AUTO_DELETE_DELAY)
-            if delay > 0:
-                await send_and_delete(client, message.chat.id, output_path, new_file_name, caption, delay)
-            else:
-                await client.send_message(message.chat.id, caption)
-                with open(output_path, 'rb') as f:
-                    await client.send_document(message.chat.id, document=f, file_name=new_file_name)
+            await send_and_delete(client, message.chat.id, output_path, new_file_name, caption, delay)
                     
     except Exception as e:
         logger.error(f"Erreur pages with password: {e}")
@@ -1176,6 +1501,130 @@ async def process_pages_with_password(client, message, session, password, pages_
 
 async def process_both(client, message, session, password):
     await process_both_final(client, message, session, password, "")
+
+async def process_clean_username(client, message, session):
+    """Fonction dédiée pour nettoyer uniquement les usernames du nom de fichier"""
+    user_id = message.from_user.id
+    
+    # S'assurer que la session existe
+    if user_id not in sessions:
+        sessions[user_id] = {}
+    
+    # Marquer qu'on traite seulement un nettoyage
+    sessions[user_id]['cleaning_only'] = True
+    
+    # Éditer le message des boutons au lieu d'envoyer un nouveau
+    try:
+        await message.edit_message_text("🧹 Nettoyage des usernames...")
+    except:
+        status = await client.send_message(message.chat.id, "🧹 Nettoyage des usernames...")
+    
+    try:
+        file = await client.download_media(session['file_id'], file_name=f"{get_user_temp_dir(user_id)}/input.pdf")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.pdf"
+            output_path = Path(temp_dir) / f"cleaned_{session['file_name']}"
+            os.rename(file, input_path)
+            
+            with open(input_path, 'rb') as f:
+                reader = PdfReader(f)
+                writer = PdfWriter()
+                
+                # Copier toutes les pages sans modification
+                for page in reader.pages:
+                    writer.add_page(page)
+                
+                with open(output_path, 'wb') as out:
+                    writer.write(out)
+            
+            # Nettoyer le nom du fichier
+            username = session.get('username', '')
+            cleaned_name = replace_username_in_filename(session['file_name'], username)
+            
+            # Supprimer le message de statut
+            try:
+                await message.delete()
+            except:
+                pass
+            
+            # Envoyer le message de succès
+            await client.send_message(
+                message.chat.id,
+                "✅ Usernames nettoyés dans le nom du fichier !"
+            )
+            
+            # Envoyer le fichier
+            delay = session.get('delete_delay', AUTO_DELETE_DELAY)
+            await send_and_delete(client, message.chat.id, output_path, cleaned_name, delay_seconds=delay)
+                    
+    except Exception as e:
+        logger.error(f"Erreur clean_username: {e}")
+        await client.send_message(message.chat.id, MESSAGES['error'])
+    finally:
+        # IMPORTANT: Supprimer complètement la session
+        sessions.pop(user_id, None)
+
+async def process_batch_clean(client, message, user_id):
+    """Fonction batch pour nettoyer uniquement les usernames du nom de fichier"""
+    files = user_batches[user_id]
+    
+    if not files:
+        if hasattr(message, 'edit_message_text'):
+            await message.edit_message_text("❌ Aucun fichier dans le batch")
+        else:
+            await client.send_message(message.chat.id, "❌ Aucun fichier dans le batch")
+        sessions[user_id]['processing'] = False
+        return
+    
+    # Utiliser la fonction helper
+    status = await create_or_edit_status(client, message, f"🧹 Nettoyage des usernames sur {len(files)} fichiers...")
+    success_count = 0
+    error_count = 0
+    
+    for i, file_info in enumerate(files):
+        try:
+            await status.edit_text(f"🧹 Nettoyage fichier {i+1}/{len(files)}...")
+            
+            file = await client.download_media(file_info['file_id'], file_name=f"{get_user_temp_dir(user_id)}/batch_{i}.pdf")
+            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                input_path = Path(temp_dir) / "input.pdf"
+                output_path = Path(temp_dir) / f"cleaned_{file_info['file_name']}"
+                os.rename(file, input_path)
+                
+                with open(input_path, 'rb') as f:
+                    reader = PdfReader(f)
+                    writer = PdfWriter()
+                    
+                    # Copier toutes les pages sans modification
+                    for page in reader.pages:
+                        writer.add_page(page)
+                    
+                    with open(output_path, 'wb') as out:
+                        writer.write(out)
+                
+                # Nettoyer le nom du fichier
+                username = sessions[user_id].get('username', '')
+                cleaned_name = replace_username_in_filename(file_info['file_name'], username)
+                
+                delay = sessions[user_id].get('delete_delay', AUTO_DELETE_DELAY)
+                await send_and_delete(client, message.chat.id, output_path, cleaned_name, delay_seconds=delay)
+                
+                success_count += 1
+                
+        except Exception as e:
+            logger.error(f"Erreur batch clean fichier {i}: {e}")
+            error_count += 1
+    
+    await status.edit_message_text(
+        f"✅ Nettoyage terminé!\n\n"
+        f"Réussis: {success_count}\n"
+        f"Erreurs: {error_count}"
+    )
+    
+    user_batches[user_id].clear()
+    # Libérer le flag de traitement
+    sessions[user_id]['processing'] = False
 
 # Fonction de nettoyage périodique des fichiers temporaires
 async def cleanup_temp_files():
@@ -1197,6 +1646,16 @@ async def cleanup_temp_files():
                     if not any(user_dir.iterdir()):
                         user_dir.rmdir()
                         logger.info(f"Dossier utilisateur vide supprimé: {user_dir}")
+            
+            # Nettoyer les flags processing bloqués
+            for user_id in list(sessions.keys()):
+                if sessions[user_id].get('processing'):
+                    # Vérifier si le flag est bloqué depuis trop longtemps
+                    last_activity = sessions[user_id].get('last_activity')
+                    if last_activity and (current_time - last_activity) > timedelta(minutes=5):
+                        logger.info(f"Libération du flag processing bloqué pour user {user_id}")
+                        sessions[user_id]['processing'] = False
+                        
         except Exception as e:
             logger.error(f"Erreur nettoyage fichiers temp: {e}")
         
@@ -1204,11 +1663,16 @@ async def cleanup_temp_files():
 
 # Lancement du bot
 if __name__ == "__main__":
-    print("🚀 Démarrage du bot PDF (Pyrogram) avec Batch et Suppression Auto...")
+    print("🚀 Démarrage du bot PDF (Pyrogram) - VERSION CORRIGÉE")
+    print(f"🆔 PID du processus: {os.getpid()}")
+    print(f"⏰ Heure de démarrage: {datetime.now()}")
     print("✅ Bot configuré et prêt!")
-    print("👉 Envoie /start au bot pour commencer")
-    print("📦 Envoie /batch pour activer le mode batch")
-    print("🗑️ Les fichiers sont supprimés automatiquement après 5 minutes par défaut")
-    print("🧹 Nettoyage automatique des fichiers > 1 heure")
+    print("📌 Corrections appliquées:")
+    print("  - Protection anti-doublon globale")
+    print("  - Messages de succès avant envoi du fichier")
+    print("  - Suppression de session après traitement")
+    print("  - Pas de renvoi des boutons après action")
+    print("  - Pas de message de suppression dans la caption")
+    print("  - Bouton nettoyage nettoie ET ajoute le username")
     
     app.run()
