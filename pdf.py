@@ -20,7 +20,7 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, 
 # Import de la configuration
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-TOKEN = os.getenv("TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = os.getenv("ADMIN_IDS")
 MAX_FILE_SIZE = 1_400 * 1024 * 1024  # 14 GB
 MAX_BATCH_FILES = 24
