@@ -11,6 +11,7 @@ import logging
 import tempfile
 import re
 import asyncio
+import shutil
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -869,7 +870,7 @@ async def process_batch_unlock(client, message, password):
             with tempfile.TemporaryDirectory() as temp_dir:
                 input_path = Path(temp_dir) / "input.pdf"
                 output_path = Path(temp_dir) / f"unlocked_{file_info['file_name']}"
-                os.rename(file, input_path)
+                shutil.move(file, input_path)
                 
                 with open(input_path, 'rb') as f:
                     reader = PdfReader(f)
@@ -953,7 +954,7 @@ async def process_batch_pages(client, message, pages_text):
             with tempfile.TemporaryDirectory() as temp_dir:
                 input_path = Path(temp_dir) / "input.pdf"
                 output_path = Path(temp_dir) / f"modified_{file_info['file_name']}"
-                os.rename(file, input_path)
+                shutil.move(file, input_path)
                 
                 with open(input_path, 'rb') as f:
                     reader = PdfReader(f)
@@ -1041,7 +1042,7 @@ async def process_batch_both(client, message, password, pages_text):
             with tempfile.TemporaryDirectory() as temp_dir:
                 input_path = Path(temp_dir) / "input.pdf"
                 output_path = Path(temp_dir) / f"both_{file_info['file_name']}"
-                os.rename(file, input_path)
+                shutil.move(file, input_path)
                 
                 with open(input_path, 'rb') as f:
                     reader = PdfReader(f)
@@ -1108,7 +1109,7 @@ async def process_unlock(client, message, session, password):
         with tempfile.TemporaryDirectory() as temp_dir:
             input_path = Path(temp_dir) / "input.pdf"
             output_path = Path(temp_dir) / f"unlocked_{session['file_name']}"
-            os.rename(file, input_path)
+            shutil.move(file, input_path)
             with open(input_path, 'rb') as f:
                 reader = PdfReader(f)
                 logger.info(f"🔓 PDF encrypted: {reader.is_encrypted}")
@@ -1196,7 +1197,7 @@ async def process_pages(client, message, session, pages_text):
         with tempfile.TemporaryDirectory() as temp_dir:
             input_path = Path(temp_dir) / "input.pdf"
             output_path = Path(temp_dir) / f"modified_{session['file_name']}"
-            os.rename(file, input_path)
+            shutil.move(file, input_path)
             with open(input_path, 'rb') as f:
                 reader = PdfReader(f)
                 
@@ -1346,7 +1347,7 @@ async def process_both_final(client, message, session, password, pages_text):
         with tempfile.TemporaryDirectory() as temp_dir:
             input_path = Path(temp_dir) / "input.pdf"
             output_path = Path(temp_dir) / f"both_{session['file_name']}"
-            os.rename(file, input_path)
+            shutil.move(file, input_path)
             
             with open(input_path, 'rb') as f:
                 reader = PdfReader(f)
@@ -1442,7 +1443,7 @@ async def process_pages_with_password(client, message, session, password, pages_
         with tempfile.TemporaryDirectory() as temp_dir:
             input_path = Path(temp_dir) / "input.pdf"
             output_path = Path(temp_dir) / f"modified_{session['file_name']}"
-            os.rename(file, input_path)
+            shutil.move(file, input_path)
             with open(input_path, 'rb') as f:
                 reader = PdfReader(f)
                 
@@ -1524,7 +1525,7 @@ async def process_clean_username(client, message, session):
         with tempfile.TemporaryDirectory() as temp_dir:
             input_path = Path(temp_dir) / "input.pdf"
             output_path = Path(temp_dir) / f"cleaned_{session['file_name']}"
-            os.rename(file, input_path)
+            shutil.move(file, input_path)
             
             with open(input_path, 'rb') as f:
                 reader = PdfReader(f)
@@ -1590,7 +1591,7 @@ async def process_batch_clean(client, message, user_id):
             with tempfile.TemporaryDirectory() as temp_dir:
                 input_path = Path(temp_dir) / "input.pdf"
                 output_path = Path(temp_dir) / f"cleaned_{file_info['file_name']}"
-                os.rename(file, input_path)
+                shutil.move(file, input_path)
                 
                 with open(input_path, 'rb') as f:
                     reader = PdfReader(f)
