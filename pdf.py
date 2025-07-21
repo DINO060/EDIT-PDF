@@ -18,14 +18,14 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 # Import de la configuration
-try:
-    from config import API_ID, API_HASH, BOT_TOKEN, MAX_FILE_SIZE, MESSAGES as CONFIG_MESSAGES
-except ImportError:
-    print("❌ Fichier config.py manquant!")
-    print("Copie config_example.py vers config.py et configure tes clés API")
-    sys.exit(1)
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+TOKEN = os.getenv("TOKEN")
+ADMIN_IDS = os.getenv("ADMIN_IDS")
+MAX_FILE_SIZE = 1_400 * 1024 * 1024  # 14 GB
 MAX_BATCH_FILES = 24
 AUTO_DELETE_DELAY = 300  # 5 minutes
+
 
 # Messages du bot (peuvent être surchargés par config.py)
 MESSAGES = {
