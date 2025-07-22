@@ -148,7 +148,7 @@ async def send_force_join_message(client, message):
         message.chat.id,
         MESSAGES['force_join'].format(channel=FORCE_JOIN_CHANNEL),
         reply_markup=keyboard,
-        parse_mode="Markdown"
+        parse_mode="markdown"
     )
 
 def get_user_temp_dir(user_id):
