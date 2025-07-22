@@ -118,23 +118,32 @@ async def is_user_in_channel(user_id):
     # Exemption pour les admins
     admin_list = [int(x) for x in str(ADMIN_IDS).split(',') if x.strip()] if ADMIN_IDS else []
     if user_id in admin_list:
+        logger.info(f"🔓 User {user_id} is admin - bypassing channel check")
         return True
+    
+    logger.info(f"🔍 Checking channel membership for user {user_id} in @{FORCE_JOIN_CHANNEL}")
     
     try:
         member = await app.get_chat_member(FORCE_JOIN_CHANNEL, user_id)
+        logger.info(f"🔍 Member status for user {user_id}: {member.status}")
+        
         if member.status in ['member', 'administrator', 'creator']:
+            logger.info(f"✅ User {user_id} is member of channel")
             return True
-        return False
+        else:
+            logger.info(f"❌ User {user_id} is not member (status: {member.status})")
+            return False
     except UserNotParticipant:
+        logger.error(f"❌ User {user_id} is not participant in channel {FORCE_JOIN_CHANNEL}")
         return False
     except ChatAdminRequired:
-        logger.error(f"Bot is not admin in channel {FORCE_JOIN_CHANNEL}")
+        logger.error(f"❌ Bot is not admin in channel {FORCE_JOIN_CHANNEL}")
         return True  # On laisse passer pour éviter de bloquer
     except UsernameNotOccupied:
-        logger.error(f"Channel {FORCE_JOIN_CHANNEL} does not exist")
+        logger.error(f"❌ Channel {FORCE_JOIN_CHANNEL} does not exist")
         return True
     except Exception as e:
-        logger.error(f"Error checking channel membership: {e}")
+        logger.error(f"❌ Error checking channel membership for user {user_id}: {e}")
         return True  # En cas d'erreur, on laisse passer
 
 async def send_force_join_message(client, message):
@@ -487,8 +496,12 @@ async def handle_document(client, message: Message):
 @app.on_callback_query(filters.regex("^check_joined$"))
 async def check_joined_handler(client, query: CallbackQuery):
     user_id = query.from_user.id
+    logger.info(f"🔍 check_joined_handler appelé pour user {user_id}")
     
-    if await is_user_in_channel(user_id):
+    is_member = await is_user_in_channel(user_id)
+    logger.info(f"🔍 Résultat vérification membership pour user {user_id}: {is_member}")
+    
+    if is_member:
         await query.answer("✅ Thank you! You can now use the bot.", show_alert=True)
         await query.message.delete()
         # Afficher le message de bienvenue
@@ -497,8 +510,10 @@ async def check_joined_handler(client, query: CallbackQuery):
             [InlineKeyboardButton("📦 Batch Mode", callback_data="batch_mode")]
         ])
         await client.send_message(user_id, MESSAGES['start'], reply_markup=keyboard)
+        logger.info(f"✅ User {user_id} successfully verified and welcome message sent")
     else:
         await query.answer("❌ You haven't joined the channel yet!", show_alert=True)
+        logger.info(f"❌ User {user_id} verification failed - not member of channel")
 
 @app.on_callback_query()
 async def button_callback(client, query: CallbackQuery):
