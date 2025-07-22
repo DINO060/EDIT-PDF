@@ -42,15 +42,15 @@ MESSAGES = {
     'success_unlock': "✅ PDF unlocked successfully!",
     'success_pages': "✅ Pages removed successfully!",
     'error': "❌ Error during processing",
-    'force_join': """🚫 <b>Access Denied!</b>
+    'force_join': """🚫 *Access Denied!*
 
 To use this bot, you must first join our official channel:
 👉 @{channel}
 
 ✅ Click the button below to join.
-Once done, click "I have joined" to continue.
+Once done, click \"I have joined\" to continue.
 
-<i>Thank you for your support! 💙</i>"""
+_Thank you for your support! 💙_"""
 }
 
 # Surcharger avec les messages de config.py s'ils existent
@@ -156,7 +156,7 @@ async def send_force_join_message(client, message):
         message.chat.id,
         MESSAGES['force_join'].format(channel=FORCE_JOIN_CHANNEL),
         reply_markup=keyboard,
-        parse_mode="html"
+        parse_mode="Markdown"
     )
 
 def get_user_temp_dir(user_id):
