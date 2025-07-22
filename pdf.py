@@ -19,6 +19,7 @@ from collections import defaultdict
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import UserNotParticipant, ChatAdminRequired, UsernameNotOccupied
+from pyrogram.enums import ChatMemberStatus
 
 # Import de la configuration
 API_ID = int(os.getenv("API_ID"))
@@ -125,13 +126,26 @@ async def is_user_in_channel(user_id):
     
     try:
         member = await app.get_chat_member(FORCE_JOIN_CHANNEL, user_id)
-        logger.info(f"🔍 Member status for user {user_id}: {member.status}")
+        status = member.status
+        logger.info(f"🔍 Member status for user {user_id}: {status}")
         
-        if member.status in ['member', 'administrator', 'creator']:
-            logger.info(f"✅ User {user_id} is member of channel")
+        # Accepter tous les statuts valides avec les constantes Pyrogram
+        valid_statuses = [
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR, 
+            ChatMemberStatus.OWNER,
+            ChatMemberStatus.CREATOR
+        ]
+        
+        # Debug: afficher tous les statuts possibles pour comparaison
+        logger.info(f"🔍 Valid statuses: {valid_statuses}")
+        logger.info(f"🔍 User status: {status} (type: {type(status)})")
+        
+        if status in valid_statuses:
+            logger.info(f"✅ User {user_id} is member of channel (status: {status})")
             return True
         else:
-            logger.info(f"❌ User {user_id} is not member (status: {member.status})")
+            logger.info(f"❌ User {user_id} is not member (status: {status})")
             return False
     except UserNotParticipant:
         logger.error(f"❌ User {user_id} is not participant in channel {FORCE_JOIN_CHANNEL}")
