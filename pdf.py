@@ -529,10 +529,13 @@ async def check_joined_handler(client, query: CallbackQuery):
         await query.answer("❌ You haven't joined the channel yet!", show_alert=True)
         logger.info(f"❌ User {user_id} verification failed - not member of channel")
 
-@app.on_callback_query()
+@app.on_callback_query() 
 async def button_callback(client, query: CallbackQuery):
+    # Debug logging
+    logger.info(f"DEBUG callback_query data: {query.data}")
+    
     if query.data == "check_joined":
-        return  # Déjà géré par le handler spécifique
+        return  # Already handled by specific handler
     
     await query.answer()
     
@@ -542,16 +545,16 @@ async def button_callback(client, query: CallbackQuery):
     if user_id not in sessions:
         sessions[user_id] = {}
     
-    # Vérifier si une action est déjà en cours (sauf pour clean_username)
+    # Check if action is already in progress (except for clean_username)
     if sessions[user_id].get('processing') and not data.startswith("clean_username"):
         await query.answer("⏳ Processing already in progress...", show_alert=True)
         return
     
-    # NE PAS marquer processing=True pour clean_username
+    # Don't mark processing=True for clean_username
     if not data.startswith("clean_username") and not data.startswith("cancel"):
         sessions[user_id]['processing'] = True
     
-    # Gestion du mode batch
+    # Batch mode handling
     if data == "batch_mode":
         sessions[user_id]['batch_mode'] = True
         
@@ -564,7 +567,7 @@ async def button_callback(client, query: CallbackQuery):
         sessions[user_id]['processing'] = False
         return
     
-    # Gestion batch clear
+    # Batch clear handling
     elif data.startswith("batch_clear:"):
         user_id = int(data.split(":")[1])
         user_batches[user_id].clear()
@@ -572,22 +575,26 @@ async def button_callback(client, query: CallbackQuery):
         sessions[user_id]['processing'] = False
         return
     
-    # Gestion des actions batch
+    # Batch actions handling - FIXED SECTION
     elif data.startswith("batch_"):
-        action, user_id = data.split(":")
-        user_id = int(user_id)
+        parts = data.split(":")
+        action = parts[0]
+        user_id = int(parts[1]) if len(parts) > 1 else query.from_user.id
+        
+        # Ensure user session exists
+        if user_id not in sessions:
+            sessions[user_id] = {}
         
         if action == "batch_clean":
             await process_batch_clean(client, query.message, user_id)
             return
+        
         elif action == "batch_unlock":
-            sessions[user_id] = sessions.get(user_id, {})
             sessions[user_id]['batch_action'] = 'unlock'
             sessions[user_id]['awaiting_batch_password'] = True
             await query.edit_message_text("🔐 Send me the password for all PDFs:")
         
         elif action == "batch_pages":
-            sessions[user_id] = sessions.get(user_id, {})
             sessions[user_id]['batch_action'] = 'pages'
             await query.edit_message_text(
                 "📝 Which pages to remove from all files?\n\n"
@@ -598,50 +605,62 @@ async def button_callback(client, query: CallbackQuery):
             )
         
         elif action == "batch_both":
-            sessions[user_id] = sessions.get(user_id, {})
             sessions[user_id]['batch_action'] = 'both'
             sessions[user_id]['awaiting_batch_both_password'] = True
             await query.edit_message_text(
                 "🛠️ **The Both - Batch**\n\n"
                 "Step 1/2: Send me the password (or 'none'):"
             )
+        
+        # FIXED: Added batch_both_first, batch_both_last, batch_both_middle, batch_both_manual handlers
         elif action == "batch_both_first":
             password = sessions[user_id].get('batch_both_password', '')
             if password:
                 await process_batch_both(client, query.message, password, "1")
             else:
                 await query.edit_message_text("❌ Error: missing password")
+        
         elif action == "batch_both_last":
             password = sessions[user_id].get('batch_both_password', '')
             if password:
                 files = user_batches[user_id]
                 if files:
                     file = await client.download_media(files[0]['file_id'], file_name=f"{get_user_temp_dir(user_id)}/temp.pdf")
-                    with open(file, 'rb') as f:
-                        reader = PdfReader(f)
-                        total_pages = len(reader.pages)
-                    os.remove(file)
-                    await process_batch_both(client, query.message, password, str(total_pages))
+                    try:
+                        with open(file, 'rb') as f:
+                            reader = PdfReader(f)
+                            total_pages = len(reader.pages)
+                        os.remove(file)
+                        await process_batch_both(client, query.message, password, str(total_pages))
+                    except Exception as e:
+                        logger.error(f"Error getting last page: {e}")
+                        await query.edit_message_text("❌ Error reading PDF")
                 else:
                     await query.edit_message_text("❌ No files in batch")
             else:
                 await query.edit_message_text("❌ Error: missing password")
+        
         elif action == "batch_both_middle":
             password = sessions[user_id].get('batch_both_password', '')
             if password:
                 files = user_batches[user_id]
                 if files:
                     file = await client.download_media(files[0]['file_id'], file_name=f"{get_user_temp_dir(user_id)}/temp.pdf")
-                    with open(file, 'rb') as f:
-                        reader = PdfReader(f)
-                        total_pages = len(reader.pages)
-                    middle = total_pages // 2 if total_pages % 2 == 0 else (total_pages // 2) + 1
-                    os.remove(file)
-                    await process_batch_both(client, query.message, password, str(middle))
+                    try:
+                        with open(file, 'rb') as f:
+                            reader = PdfReader(f)
+                            total_pages = len(reader.pages)
+                        middle = total_pages // 2 if total_pages % 2 == 0 else (total_pages // 2) + 1
+                        os.remove(file)
+                        await process_batch_both(client, query.message, password, str(middle))
+                    except Exception as e:
+                        logger.error(f"Error getting middle page: {e}")
+                        await query.edit_message_text("❌ Error reading PDF")
                 else:
                     await query.edit_message_text("❌ No files in batch")
             else:
                 await query.edit_message_text("❌ Error: missing password")
+        
         elif action == "batch_both_manual":
             sessions[user_id]['awaiting_batch_both_pages'] = True
             await query.edit_message_text(
