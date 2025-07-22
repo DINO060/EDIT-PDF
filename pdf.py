@@ -3,6 +3,7 @@
 Bot Telegram pour la gestion des PDF
 Compatible avec Python 3.13 et python-telegram-bot 21.x
 Avec support batch (24 fichiers max) et suppression automatique
+Version anglaise avec Force Join Channel
 """
 
 import os
@@ -17,26 +18,39 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.errors import UserNotParticipant, ChatAdminRequired, UsernameNotOccupied
 
 # Import de la configuration
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = os.getenv("ADMIN_IDS")
+
+# 🔥 CONFIGURATION FORCE JOIN CHANNEL 🔥
+FORCE_JOIN_CHANNEL = "djd208"  # ⚠️ REMPLACE PAR TON CANAL (sans @)
+
 MAX_FILE_SIZE = 1_400 * 1024 * 1024  # 14 GB
 MAX_BATCH_FILES = 24
 AUTO_DELETE_DELAY = 300  # 5 minutes
 
-
-# Messages du bot (peuvent être surchargés par config.py)
+# Messages du bot en anglais
 MESSAGES = {
-    'start': "🤖 Bot PDF Manager prêt à l'emploi!\n\n📄 **Mode Normal** : Envoie un PDF pour le traiter\n📦 **Mode Batch** : Traite jusqu'à 24 fichiers d'un coup avec `/batch`\n\nEnvoie-moi un PDF pour commencer!",
-    'not_pdf': "❌ Ce n'est pas un fichier PDF !",
-    'file_too_big': "❌ Fichier trop volumineux !",
-    'processing': "⏳ Traitement en cours...",
-    'success_unlock': "✅ PDF déverrouillé avec succès !",
-    'success_pages': "✅ Pages supprimées avec succès !",
-    'error': "❌ Erreur lors du traitement"
+    'start': "🤖 PDF Manager Bot ready!\n\n📄 **Normal Mode**: Send a PDF to process it\n📦 **Batch Mode**: Process up to 24 files at once with `/batch`\n\nSend me a PDF to get started!",
+    'not_pdf': "❌ This is not a PDF file!",
+    'file_too_big': "❌ File is too large!",
+    'processing': "⏳ Processing...",
+    'success_unlock': "✅ PDF unlocked successfully!",
+    'success_pages': "✅ Pages removed successfully!",
+    'error': "❌ Error during processing",
+    'force_join': """🚫 <b>Access Denied!</b>
+
+To use this bot, you must first join our official channel:
+👉 @{channel}
+
+✅ Click the button below to join.
+Once done, click "I have joined" to continue.
+
+<i>Thank you for your support! 💙</i>"""
 }
 
 # Surcharger avec les messages de config.py s'ils existent
@@ -48,7 +62,7 @@ except NameError:
 try:
     from PyPDF2 import PdfReader, PdfWriter, PageObject
 except ImportError:
-    print("❌ PyPDF2 n'est pas installé!")
+    print("❌ PyPDF2 is not installed!")
     print("Execute: pip install PyPDF2==3.0.1")
     sys.exit(1)
 
@@ -105,6 +119,45 @@ app = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
 )
+
+# 🔥 FONCTIONS FORCE JOIN CHANNEL 🔥
+async def is_user_in_channel(user_id):
+    """Vérifie si l'utilisateur est membre du canal"""
+    # Exemption pour les admins
+    admin_list = [int(x) for x in str(ADMIN_IDS).split(',') if x.strip()] if ADMIN_IDS else []
+    if user_id in admin_list:
+        return True
+    
+    try:
+        member = await app.get_chat_member(FORCE_JOIN_CHANNEL, user_id)
+        if member.status in ['member', 'administrator', 'creator']:
+            return True
+        return False
+    except UserNotParticipant:
+        return False
+    except ChatAdminRequired:
+        logger.error(f"Bot is not admin in channel {FORCE_JOIN_CHANNEL}")
+        return True  # On laisse passer pour éviter de bloquer
+    except UsernameNotOccupied:
+        logger.error(f"Channel {FORCE_JOIN_CHANNEL} does not exist")
+        return True
+    except Exception as e:
+        logger.error(f"Error checking channel membership: {e}")
+        return True  # En cas d'erreur, on laisse passer
+
+async def send_force_join_message(client, message):
+    """Envoie le message demandant de rejoindre le canal"""
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📢 Join @{FORCE_JOIN_CHANNEL}", url=f"https://t.me/{FORCE_JOIN_CHANNEL}")],
+        [InlineKeyboardButton("✅ I have joined", callback_data="check_joined")]
+    ])
+    
+    await client.send_message(
+        message.chat.id,
+        MESSAGES['force_join'].format(channel=FORCE_JOIN_CHANNEL),
+        reply_markup=keyboard,
+        parse_mode="html"
+    )
 
 def get_user_temp_dir(user_id):
     """Retourne le dossier temporaire spécifique à l'utilisateur"""
@@ -220,6 +273,11 @@ async def start_handler(client, message: Message):
     global cleanup_task_started
     user_id = message.from_user.id
     
+    # 🔥 VÉRIFICATION FORCE JOIN 🔥
+    if not await is_user_in_channel(user_id):
+        await send_force_join_message(client, message)
+        return
+    
     # DEBUG EXPRESS - Vérifier les doubles instances
     print(f"DEBUG START: Appel handler /start pour user {user_id} à {datetime.now()}")
     
@@ -250,8 +308,8 @@ async def start_handler(client, message: Message):
         sessions[user_id]['delete_delay'] = delete_delay
     
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚙️ Paramètre", callback_data="settings")],
-        [InlineKeyboardButton("📦 Mode Batch", callback_data="batch_mode")]
+        [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
+        [InlineKeyboardButton("📦 Batch Mode", callback_data="batch_mode")]
     ])
     
     await client.send_message(message.chat.id, MESSAGES['start'], reply_markup=keyboard)
@@ -259,6 +317,11 @@ async def start_handler(client, message: Message):
 @app.on_message(filters.command("batch") & filters.private)
 async def batch_command(client, message: Message):
     user_id = message.from_user.id
+    
+    # 🔥 VÉRIFICATION FORCE JOIN 🔥
+    if not await is_user_in_channel(user_id):
+        await send_force_join_message(client, message)
+        return
     
     # Protection anti-doublon
     if is_duplicate_message(user_id, message.id, "batch"):
@@ -279,17 +342,17 @@ async def batch_command(client, message: Message):
     if count > 0:
         await client.send_message(
             message.chat.id,
-            f"📦 **Mode Batch**\n\n"
-            f"Tu as {count} fichier(s) en attente.\n"
-            f"Maximum: {MAX_BATCH_FILES} fichiers\n\n"
-            f"Envoie `/process` pour traiter tous les fichiers"
+            f"📦 **Batch Mode**\n\n"
+            f"You have {count} file(s) waiting.\n"
+            f"Maximum: {MAX_BATCH_FILES} files\n\n"
+            f"Send `/process` to process all files"
         )
     else:
         await client.send_message(
             message.chat.id,
-            f"📦 **Mode Batch**\n\n"
-            f"Aucun fichier en attente.\n"
-            f"Envoie jusqu'à {MAX_BATCH_FILES} fichiers PDF puis `/process`"
+            f"📦 **Batch Mode**\n\n"
+            f"No files waiting.\n"
+            f"Send up to {MAX_BATCH_FILES} PDF files then `/process`"
         )
     
     # Libérer le flag
@@ -298,6 +361,11 @@ async def batch_command(client, message: Message):
 @app.on_message(filters.command("process") & filters.private)
 async def process_batch_command(client, message: Message):
     user_id = message.from_user.id
+    
+    # 🔥 VÉRIFICATION FORCE JOIN 🔥
+    if not await is_user_in_channel(user_id):
+        await send_force_join_message(client, message)
+        return
     
     # Protection anti-doublon
     if is_duplicate_message(user_id, message.id, "process"):
@@ -315,23 +383,23 @@ async def process_batch_command(client, message: Message):
     sessions[user_id]['process_command_processing'] = True
     
     if not user_batches[user_id]:
-        await client.send_message(message.chat.id, "❌ Aucun fichier en attente dans le batch")
+        await client.send_message(message.chat.id, "❌ No files waiting in the batch")
         sessions[user_id]['process_command_processing'] = False
         return
     
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧹 Nettoyer usernames (tous)", callback_data=f"batch_clean:{user_id}")],
-        [InlineKeyboardButton("🔓 Déverrouiller tous", callback_data=f"batch_unlock:{user_id}")],
-        [InlineKeyboardButton("🗑️ Supprimer pages (tous)", callback_data=f"batch_pages:{user_id}")],
-        [InlineKeyboardButton("🛠️ The Both (tous)", callback_data=f"batch_both:{user_id}")],
-        [InlineKeyboardButton("🧹 Vider le batch", callback_data=f"batch_clear:{user_id}")]
+        [InlineKeyboardButton("🧹 Clean usernames (all)", callback_data=f"batch_clean:{user_id}")],
+        [InlineKeyboardButton("🔓 Unlock all", callback_data=f"batch_unlock:{user_id}")],
+        [InlineKeyboardButton("🗑️ Remove pages (all)", callback_data=f"batch_pages:{user_id}")],
+        [InlineKeyboardButton("🛠️ The Both (all)", callback_data=f"batch_both:{user_id}")],
+        [InlineKeyboardButton("🧹 Clear batch", callback_data=f"batch_clear:{user_id}")]
     ])
     
     await client.send_message(
         message.chat.id,
-        f"📦 **Traitement Batch**\n\n"
-        f"{len(user_batches[user_id])} fichier(s) prêt(s)\n\n"
-        f"Que veux-tu faire?",
+        f"📦 **Batch Processing**\n\n"
+        f"{len(user_batches[user_id])} file(s) ready\n\n"
+        f"What do you want to do?",
         reply_markup=keyboard
     )
     
@@ -341,6 +409,11 @@ async def process_batch_command(client, message: Message):
 @app.on_message(filters.document & filters.private)
 async def handle_document(client, message: Message):
     user_id = message.from_user.id
+    
+    # 🔥 VÉRIFICATION FORCE JOIN 🔥
+    if not await is_user_in_channel(user_id):
+        await send_force_join_message(client, message)
+        return
     
     # Protection anti-doublon
     if is_duplicate_message(user_id, message.id, "document"):
@@ -370,7 +443,7 @@ async def handle_document(client, message: Message):
     # Vérifier si on est en mode batch
     if sessions.get(user_id, {}).get('batch_mode'):
         if len(user_batches[user_id]) >= MAX_BATCH_FILES:
-            await client.send_message(message.chat.id, f"❌ Limite de {MAX_BATCH_FILES} fichiers atteinte!")
+            await client.send_message(message.chat.id, f"❌ Limit of {MAX_BATCH_FILES} files reached!")
             return
         
         user_batches[user_id].append({
@@ -380,8 +453,8 @@ async def handle_document(client, message: Message):
         
         await client.send_message(
             message.chat.id,
-            f"✅ Fichier ajouté au batch ({len(user_batches[user_id])}/{MAX_BATCH_FILES})\n\n"
-            f"Envoie `/process` quand tu as fini d'ajouter des fichiers"
+            f"✅ File added to batch ({len(user_batches[user_id])}/{MAX_BATCH_FILES})\n\n"
+            f"Send `/process` when you're done adding files"
         )
         return
     
@@ -406,21 +479,41 @@ async def handle_document(client, message: Message):
         sessions[user_id]['delete_delay'] = delete_delay
     
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧹 Nettoyer usernames", callback_data=f"clean_username:{user_id}")],
-        [InlineKeyboardButton("🔓 Déverrouiller", callback_data=f"unlock:{user_id}")],
-        [InlineKeyboardButton("🗑️ Supprimer des pages", callback_data=f"pages:{user_id}")],
+        [InlineKeyboardButton("🧹 Clean usernames", callback_data=f"clean_username:{user_id}")],
+        [InlineKeyboardButton("🔓 Unlock", callback_data=f"unlock:{user_id}")],
+        [InlineKeyboardButton("🗑️ Remove pages", callback_data=f"pages:{user_id}")],
         [InlineKeyboardButton("🛠️ The Both", callback_data=f"both:{user_id}")],
-        [InlineKeyboardButton("❌ Annuler", callback_data=f"cancel:{user_id}")]
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")]
     ])
     
     await client.send_message(
         message.chat.id,
-        f"Fichier reçu: {file_name}\n\nQue veux-tu faire?",
+        f"File received: {file_name}\n\nWhat do you want to do?",
         reply_markup=keyboard
     )
 
+# 🔥 HANDLER POUR LE BOUTON "I have joined" 🔥
+@app.on_callback_query(filters.regex("^check_joined$"))
+async def check_joined_handler(client, query: CallbackQuery):
+    user_id = query.from_user.id
+    
+    if await is_user_in_channel(user_id):
+        await query.answer("✅ Thank you! You can now use the bot.", show_alert=True)
+        await query.message.delete()
+        # Afficher le message de bienvenue
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
+            [InlineKeyboardButton("📦 Batch Mode", callback_data="batch_mode")]
+        ])
+        await client.send_message(user_id, MESSAGES['start'], reply_markup=keyboard)
+    else:
+        await query.answer("❌ You haven't joined the channel yet!", show_alert=True)
+
 @app.on_callback_query()
 async def button_callback(client, query: CallbackQuery):
+    if query.data == "check_joined":
+        return  # Déjà géré par le handler spécifique
+    
     await query.answer()
     
     data = query.data
@@ -431,7 +524,7 @@ async def button_callback(client, query: CallbackQuery):
     
     # Vérifier si une action est déjà en cours (sauf pour clean_username)
     if sessions[user_id].get('processing') and not data.startswith("clean_username"):
-        await query.answer("⏳ Traitement déjà en cours...", show_alert=True)
+        await query.answer("⏳ Processing already in progress...", show_alert=True)
         return
     
     # NE PAS marquer processing=True pour clean_username
@@ -443,10 +536,10 @@ async def button_callback(client, query: CallbackQuery):
         sessions[user_id]['batch_mode'] = True
         
         await query.edit_message_text(
-            f"📦 **Mode Batch Activé**\n\n"
-            f"Tu peux maintenant envoyer jusqu'à {MAX_BATCH_FILES} fichiers PDF.\n"
-            f"Quand tu as fini, envoie `/process` pour les traiter.\n\n"
-            f"Pour désactiver le mode batch, envoie `/start`"
+            f"📦 **Batch Mode Activated**\n\n"
+            f"You can now send up to {MAX_BATCH_FILES} PDF files.\n"
+            f"When you're done, send `/process` to process them.\n\n"
+            f"To disable batch mode, send `/start`"
         )
         sessions[user_id]['processing'] = False
         return
@@ -455,7 +548,7 @@ async def button_callback(client, query: CallbackQuery):
     elif data.startswith("batch_clear:"):
         user_id = int(data.split(":")[1])
         user_batches[user_id].clear()
-        await query.edit_message_text("🧹 Batch vidé avec succès!")
+        await query.edit_message_text("🧹 Batch cleared successfully!")
         sessions[user_id]['processing'] = False
         return
     
@@ -471,17 +564,17 @@ async def button_callback(client, query: CallbackQuery):
             sessions[user_id] = sessions.get(user_id, {})
             sessions[user_id]['batch_action'] = 'unlock'
             sessions[user_id]['awaiting_batch_password'] = True
-            await query.edit_message_text("🔐 Envoie-moi le mot de passe pour tous les PDFs:")
+            await query.edit_message_text("🔐 Send me the password for all PDFs:")
         
         elif action == "batch_pages":
             sessions[user_id] = sessions.get(user_id, {})
             sessions[user_id]['batch_action'] = 'pages'
             await query.edit_message_text(
-                "📝 Quelles pages supprimer sur tous les fichiers?\n\n"
-                "Exemples:\n"
-                "• 1 → supprime page 1\n"
-                "• 1,3,5 → supprime pages 1, 3 et 5\n"
-                "• 1-5 → supprime pages 1 à 5"
+                "📝 Which pages to remove from all files?\n\n"
+                "Examples:\n"
+                "• 1 → removes page 1\n"
+                "• 1,3,5 → removes pages 1, 3 and 5\n"
+                "• 1-5 → removes pages 1 to 5"
             )
         
         elif action == "batch_both":
@@ -490,14 +583,14 @@ async def button_callback(client, query: CallbackQuery):
             sessions[user_id]['awaiting_batch_both_password'] = True
             await query.edit_message_text(
                 "🛠️ **The Both - Batch**\n\n"
-                "Étape 1/2: Envoie-moi le mot de passe (ou 'none'):"
+                "Step 1/2: Send me the password (or 'none'):"
             )
         elif action == "batch_both_first":
             password = sessions[user_id].get('batch_both_password', '')
             if password:
                 await process_batch_both(client, query.message, password, "1")
             else:
-                await query.edit_message_text("❌ Erreur: mot de passe manquant")
+                await query.edit_message_text("❌ Error: missing password")
         elif action == "batch_both_last":
             password = sessions[user_id].get('batch_both_password', '')
             if password:
@@ -510,9 +603,9 @@ async def button_callback(client, query: CallbackQuery):
                     os.remove(file)
                     await process_batch_both(client, query.message, password, str(total_pages))
                 else:
-                    await query.edit_message_text("❌ Aucun fichier dans le batch")
+                    await query.edit_message_text("❌ No files in batch")
             else:
-                await query.edit_message_text("❌ Erreur: mot de passe manquant")
+                await query.edit_message_text("❌ Error: missing password")
         elif action == "batch_both_middle":
             password = sessions[user_id].get('batch_both_password', '')
             if password:
@@ -526,17 +619,17 @@ async def button_callback(client, query: CallbackQuery):
                     os.remove(file)
                     await process_batch_both(client, query.message, password, str(middle))
                 else:
-                    await query.edit_message_text("❌ Aucun fichier dans le batch")
+                    await query.edit_message_text("❌ No files in batch")
             else:
-                await query.edit_message_text("❌ Erreur: mot de passe manquant")
+                await query.edit_message_text("❌ Error: missing password")
         elif action == "batch_both_manual":
             sessions[user_id]['awaiting_batch_both_pages'] = True
             await query.edit_message_text(
-                "📝 **Saisie manuelle des pages - Batch**\n\n"
-                "Envoie-moi les pages à supprimer au format :\n"
-                "• 1 → supprime page 1\n"
-                "• 1,3,5 → supprime pages 1, 3 et 5\n"
-                "• 1-5 → supprime pages 1 à 5"
+                "📝 **Manual page entry - Batch**\n\n"
+                "Send me the pages to remove:\n"
+                "• 1 → removes page 1\n"
+                "• 1,3,5 → removes pages 1, 3 and 5\n"
+                "• 1-5 → removes pages 1 to 5"
             )
         return
     
@@ -544,12 +637,12 @@ async def button_callback(client, query: CallbackQuery):
     if data == "settings":
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add Username", callback_data="add_username")],
-            [InlineKeyboardButton("⏰ Délai suppression", callback_data="set_delete_delay")],
-            [InlineKeyboardButton("🔙 Retour", callback_data="back_to_start")]
+            [InlineKeyboardButton("⏰ Delete delay", callback_data="set_delete_delay")],
+            [InlineKeyboardButton("🔙 Back", callback_data="back_to_start")]
         ])
         await query.edit_message_text(
-            "⚙️ **Paramètres**\n\n"
-            "Configure ton bot selon tes besoins.",
+            "⚙️ **Settings**\n\n"
+            "Configure the bot according to your needs.",
             reply_markup=keyboard
         )
         sessions[user_id]['processing'] = False
@@ -561,12 +654,12 @@ async def button_callback(client, query: CallbackQuery):
             [InlineKeyboardButton("5 minutes", callback_data="delay_300")],
             [InlineKeyboardButton("10 minutes", callback_data="delay_600")],
             [InlineKeyboardButton("30 minutes", callback_data="delay_1800")],
-            [InlineKeyboardButton("Jamais", callback_data="delay_0")],
-            [InlineKeyboardButton("🔙 Retour", callback_data="settings")]
+            [InlineKeyboardButton("Never", callback_data="delay_0")],
+            [InlineKeyboardButton("🔙 Back", callback_data="settings")]
         ])
         await query.edit_message_text(
-            "⏰ **Délai de suppression automatique**\n\n"
-            "Après combien de temps supprimer les fichiers?",
+            "⏰ **Auto-delete delay**\n\n"
+            "After how long should files be deleted?",
             reply_markup=keyboard
         )
         return
@@ -578,9 +671,9 @@ async def button_callback(client, query: CallbackQuery):
         sessions[user_id]['delete_delay'] = delay
         
         if delay == 0:
-            await query.edit_message_text("✅ Suppression automatique désactivée")
+            await query.edit_message_text("✅ Auto-delete disabled")
         else:
-            await query.edit_message_text(f"✅ Les fichiers seront supprimés après {delay//60} minute(s)")
+            await query.edit_message_text(f"✅ Files will be deleted after {delay//60} minute(s)")
         return
     
     elif data == "add_username":
@@ -593,12 +686,12 @@ async def button_callback(client, query: CallbackQuery):
         
         if sessions[user_id].get('username'):
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🗑️ Supprimer l'ancien", callback_data="delete_username")],
-                [InlineKeyboardButton("❌ Annuler", callback_data="settings")]
+                [InlineKeyboardButton("🗑️ Delete current", callback_data="delete_username")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="settings")]
             ])
             await query.edit_message_text(
-                f"⚠️ Un username est déjà enregistré : {sessions[user_id]['username']}\n\n"
-                "Tu dois d'abord supprimer l'ancien username avant d'en ajouter un nouveau.",
+                f"⚠️ A username is already registered: {sessions[user_id]['username']}\n\n"
+                "You must delete the current username before adding a new one.",
                 reply_markup=keyboard
             )
             logger.info(f"🔍 Affichage du message de suppression pour user {user_id}")
@@ -606,8 +699,8 @@ async def button_callback(client, query: CallbackQuery):
         else:
             sessions[user_id]['awaiting_username'] = True
             await query.edit_message_text(
-                "Envoie-moi maintenant le [@username] à ajouter.\n\n"
-                "Format: [@username] ou [📢 @username]"
+                "Send me the [@username] to add.\n\n"
+                "Format: [@username] or [📢 @username]"
             )
             logger.info(f"🔍 Mode ajout username activé pour user {user_id}")
         return
@@ -622,17 +715,17 @@ async def button_callback(client, query: CallbackQuery):
         if sessions[user_id].get('username'):
             old_username = sessions[user_id]['username']
             sessions[user_id].pop('username')
-            await query.edit_message_text(f"✅ Username supprimé : {old_username}")
+            await query.edit_message_text(f"✅ Username deleted: {old_username}")
             logger.info(f"🔍 Username supprimé pour user {user_id}: {old_username}")
         else:
-            await query.edit_message_text("ℹ️ Aucun username enregistré.")
+            await query.edit_message_text("ℹ️ No username registered.")
             logger.info(f"🔍 Aucun username à supprimer pour user {user_id}")
         return
     
     elif data == "back_to_start":
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("⚙️ Paramètre", callback_data="settings")],
-            [InlineKeyboardButton("📦 Mode Batch", callback_data="batch_mode")]
+            [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
+            [InlineKeyboardButton("📦 Batch Mode", callback_data="batch_mode")]
         ])
         await query.edit_message_text(MESSAGES['start'], reply_markup=keyboard)
         return
@@ -652,25 +745,25 @@ async def button_callback(client, query: CallbackQuery):
         sessions[user_id]['cleaning_only'] = True
         # S'assurer que la session contient les données nécessaires
         if 'file_id' not in sessions[user_id]:
-            await query.edit_message_text("❌ Aucun fichier en session. Envoie un PDF d'abord.")
+            await query.edit_message_text("❌ No file in session. Send a PDF first.")
             sessions[user_id]['processing'] = False
             return
         await process_clean_username(client, query.message, sessions[user_id])
         return
     if action == "cancel":
         sessions.pop(user_id, None)
-        await query.edit_message_text("❌ Opération annulée")
+        await query.edit_message_text("❌ Operation cancelled")
         return
     
     if user_id not in sessions:
-        await query.edit_message_text("❌ Session expirée. Renvoie le PDF.")
+        await query.edit_message_text("❌ Session expired. Send the PDF again.")
         sessions[user_id]['processing'] = False
         return
     
     sessions[user_id]['action'] = action
     
     if action == "unlock":
-        await query.edit_message_text("🔐 Envoie-moi le mot de passe du PDF:")
+        await query.edit_message_text("🔐 Send me the PDF password:")
     elif action == "pages":
         page_buttons = InlineKeyboardMarkup([
             [
@@ -680,23 +773,23 @@ async def button_callback(client, query: CallbackQuery):
             ]
         ])
         await query.edit_message_text(
-            "Quelles pages veux-tu supprimer?\n\n"
-            "Exemples:\n"
-            "• 1 → supprime page 1\n"
-            "• 1,3,5 → supprime pages 1, 3 et 5\n"
-            "• 1-5 → supprime pages 1 à 5",
+            "Which pages do you want to remove?\n\n"
+            "Examples:\n"
+            "• 1 → removes page 1\n"
+            "• 1,3,5 → removes pages 1, 3 and 5\n"
+            "• 1-5 → removes pages 1 to 5",
             reply_markup=page_buttons
         )
     elif action == "both":
         sessions[user_id]['awaiting_both_password'] = True
         await query.edit_message_text(
-            "🛠️ **The Both** - Action combinée\n\n"
-            "Cette fonction va:\n"
-            "1. Déverrouiller le PDF (si protégé)\n"
-            "2. Supprimer les pages sélectionnées\n"
-            "3. Nettoyer les @username et hashtags\n"
-            "4. Ajouter ton username personnalisé\n\n"
-            "**Étape 1/2 :** Envoie-moi le mot de passe du PDF (ou 'none' si non protégé):"
+            "🛠️ **The Both** - Combined action\n\n"
+            "This function will:\n"
+            "1. Unlock the PDF (if protected)\n"
+            "2. Remove selected pages\n"
+            "3. Clean @username and hashtags\n"
+            "4. Add your custom username\n\n"
+            "**Step 1/2:** Send me the PDF password (or 'none' if not protected):"
         )
     elif action == "firstpage":
         await process_pages(client, query.message, sessions[user_id], "1")
@@ -727,11 +820,11 @@ async def button_callback(client, query: CallbackQuery):
     elif action == "both_manual":
         sessions[user_id]['awaiting_both_pages'] = True
         await query.edit_message_text(
-            "📝 **Saisie manuelle des pages**\n\n"
-            "Envoie-moi les pages à supprimer au format :\n"
-            "• 1 → supprime page 1\n"
-            "• 1,3,5 → supprime pages 1, 3 et 5\n"
-            "• 1-5 → supprime pages 1 à 5"
+            "📝 **Manual page entry**\n\n"
+            "Send me the pages to remove:\n"
+            "• 1 → removes page 1\n"
+            "• 1,3,5 → removes pages 1, 3 and 5\n"
+            "• 1-5 → removes pages 1 to 5"
         )
 
 @app.on_message(filters.text & filters.private)
@@ -764,12 +857,12 @@ async def handle_all_text(client, message: Message):
                 InlineKeyboardButton("The last", callback_data=f"batch_both_last:{user_id}"),
                 InlineKeyboardButton("The middle", callback_data=f"batch_both_middle:{user_id}")
             ],
-            [InlineKeyboardButton("📝 Saisir manuellement", callback_data=f"batch_both_manual:{user_id}")]
+            [InlineKeyboardButton("📝 Enter manually", callback_data=f"batch_both_manual:{user_id}")]
         ])
         await client.send_message(
             message.chat.id,
-            "✅ Mot de passe reçu!\n\n"
-            "**Étape 2/2:** Choisis les pages à supprimer :",
+            "✅ Password received!\n\n"
+            "**Step 2/2:** Choose pages to remove:",
             reply_markup=keyboard
         )
         return
@@ -786,7 +879,7 @@ async def handle_all_text(client, message: Message):
         if password:
             await process_batch_both(client, message, password, pages_text)
         else:
-            await client.send_message(message.chat.id, "❌ Erreur: mot de passe manquant")
+            await client.send_message(message.chat.id, "❌ Error: missing password")
         return
 
     # Gestion username (paramètre)
@@ -796,10 +889,10 @@ async def handle_all_text(client, message: Message):
         if match:
             session['username'] = match.group()
             session['awaiting_username'] = False
-            await client.send_message(message.chat.id, f"✅ Username sauvegardé : {session['username']}")
+            await client.send_message(message.chat.id, f"✅ Username saved: {session['username']}")
             logger.info(f"🔧 Username enregistré pour user {user_id}: {session['username']}")
         else:
-            await client.send_message(message.chat.id, "❌ Aucun @username valide trouvé dans ton texte. Réessaie.")
+            await client.send_message(message.chat.id, "❌ No valid @username found in your text. Try again.")
         return
 
     # Gestion de The Both - saisie manuelle des pages
@@ -810,8 +903,8 @@ async def handle_all_text(client, message: Message):
         session['awaiting_both_password'] = True
         await client.send_message(
             message.chat.id,
-            f"✅ Pages sélectionnées : {pages_text}\n\n"
-            "**Étape 1/2 :** Envoie-moi le mot de passe du PDF (ou 'none' si non protégé):"
+            f"✅ Pages selected: {pages_text}\n\n"
+            "**Step 1/2:** Send me the PDF password (or 'none' if not protected):"
         )
         return
 
@@ -849,21 +942,21 @@ async def process_batch_unlock(client, message, password):
     if not files:
         # Utiliser edit_message_text au lieu de send_message
         if hasattr(message, 'edit_message_text'):
-            await message.edit_message_text("❌ Aucun fichier dans le batch")
+            await message.edit_message_text("❌ No files in batch")
         else:
-            await client.send_message(message.chat.id, "❌ Aucun fichier dans le batch")
+            await client.send_message(message.chat.id, "❌ No files in batch")
         sessions[user_id]['processing'] = False
         return
     
     # Utiliser la fonction helper pour créer le message de statut
     logger.info(f"🔍 Début process_batch_unlock - User {user_id} - Time: {datetime.now()}")
-    status = await create_or_edit_status(client, message, f"⏳ Traitement de {len(files)} fichiers...")
+    status = await create_or_edit_status(client, message, f"⏳ Processing {len(files)} files...")
     success_count = 0
     error_count = 0
     
     for i, file_info in enumerate(files):
         try:
-            await status.edit_text(f"⏳ Traitement fichier {i+1}/{len(files)}...")
+            await status.edit_text(f"⏳ Processing file {i+1}/{len(files)}...")
             
             file = await client.download_media(file_info['file_id'], file_name=f"{get_user_temp_dir(user_id)}/batch_{i}.pdf")
             
@@ -900,9 +993,9 @@ async def process_batch_unlock(client, message, password):
             error_count += 1
     
     await status.edit_text(
-        f"✅ Traitement terminé!\n\n"
-        f"Réussis: {success_count}\n"
-        f"Erreurs: {error_count}"
+        f"✅ Processing complete!\n\n"
+        f"Successful: {success_count}\n"
+        f"Errors: {error_count}"
     )
     
     user_batches[user_id].clear()
@@ -916,9 +1009,9 @@ async def process_batch_pages(client, message, pages_text):
     
     if not files:
         if hasattr(message, 'edit_message_text'):
-            await message.edit_message_text("❌ Aucun fichier dans le batch")
+            await message.edit_message_text("❌ No files in batch")
         else:
-            await client.send_message(message.chat.id, "❌ Aucun fichier dans le batch")
+            await client.send_message(message.chat.id, "❌ No files in batch")
         sessions[user_id]['processing'] = False
         return
     
@@ -933,21 +1026,21 @@ async def process_batch_pages(client, message, pages_text):
                 pages_to_remove.add(int(part))
     except ValueError:
         if hasattr(message, 'edit_message_text'):
-            await message.edit_message_text("❌ Format invalide. Utilise: 1,3,5 ou 1-5")
+            await message.edit_message_text("❌ Invalid format. Use: 1,3,5 or 1-5")
         else:
-            await client.send_message(message.chat.id, "❌ Format invalide. Utilise: 1,3,5 ou 1-5")
+            await client.send_message(message.chat.id, "❌ Invalid format. Use: 1,3,5 or 1-5")
         sessions[user_id]['processing'] = False
         return
     
     # Utiliser la fonction helper
     logger.info(f"🔍 Début process_batch_pages - User {user_id} - Time: {datetime.now()}")
-    status = await create_or_edit_status(client, message, f"⏳ Traitement de {len(files)} fichiers...")
+    status = await create_or_edit_status(client, message, f"⏳ Processing {len(files)} files...")
     success_count = 0
     error_count = 0
     
     for i, file_info in enumerate(files):
         try:
-            await status.edit_text(f"⏳ Traitement fichier {i+1}/{len(files)}...")
+            await status.edit_text(f"⏳ Processing file {i+1}/{len(files)}...")
             
             file = await client.download_media(file_info['file_id'], file_name=f"{get_user_temp_dir(user_id)}/batch_{i}.pdf")
             
@@ -988,9 +1081,9 @@ async def process_batch_pages(client, message, pages_text):
             error_count += 1
     
     await status.edit_text(
-        f"✅ Traitement terminé!\n\n"
-        f"Réussis: {success_count}\n"
-        f"Erreurs: {error_count}"
+        f"✅ Processing complete!\n\n"
+        f"Successful: {success_count}\n"
+        f"Errors: {error_count}"
     )
     
     user_batches[user_id].clear()
@@ -1004,9 +1097,9 @@ async def process_batch_both(client, message, password, pages_text):
     
     if not files:
         if hasattr(message, 'edit_message_text'):
-            await message.edit_message_text("❌ Aucun fichier dans le batch")
+            await message.edit_message_text("❌ No files in batch")
         else:
-            await client.send_message(message.chat.id, "❌ Aucun fichier dans le batch")
+            await client.send_message(message.chat.id, "❌ No files in batch")
         sessions[user_id]['processing'] = False
         return
     
@@ -1021,21 +1114,21 @@ async def process_batch_both(client, message, password, pages_text):
                 pages_to_remove.add(int(part))
     except ValueError:
         if hasattr(message, 'edit_message_text'):
-            await message.edit_message_text("❌ Format invalide. Utilise: 1,3,5 ou 1-5")
+            await message.edit_message_text("❌ Invalid format. Use: 1,3,5 or 1-5")
         else:
-            await client.send_message(message.chat.id, "❌ Format invalide. Utilise: 1,3,5 ou 1-5")
+            await client.send_message(message.chat.id, "❌ Invalid format. Use: 1,3,5 or 1-5")
         sessions[user_id]['processing'] = False
         return
     
     # Utiliser la fonction helper
     logger.info(f"🔍 Début process_batch_both - User {user_id} - Time: {datetime.now()}")
-    status = await create_or_edit_status(client, message, f"⏳ Traitement combiné de {len(files)} fichiers...")
+    status = await create_or_edit_status(client, message, f"⏳ Combined processing of {len(files)} files...")
     success_count = 0
     error_count = 0
     
     for i, file_info in enumerate(files):
         try:
-            await status.edit_text(f"⏳ Traitement fichier {i+1}/{len(files)}...")
+            await status.edit_text(f"⏳ Processing file {i+1}/{len(files)}...")
             
             file = await client.download_media(file_info['file_id'], file_name=f"{get_user_temp_dir(user_id)}/batch_{i}.pdf")
             
@@ -1081,9 +1174,9 @@ async def process_batch_both(client, message, password, pages_text):
             error_count += 1
     
     await status.edit_text(
-        f"✅ Traitement combiné terminé!\n\n"
-        f"Réussis: {success_count}\n"
-        f"Erreurs: {error_count}"
+        f"✅ Combined processing complete!\n\n"
+        f"Successful: {success_count}\n"
+        f"Errors: {error_count}"
     )
     
     user_batches[user_id].clear()
@@ -1123,7 +1216,7 @@ async def process_unlock(client, message, session, password):
                     # D'abord envoyer le message
                     await client.send_message(
                         message.chat.id,
-                        "ℹ️ Ce PDF n'était pas protégé.\n\n✅ Usernames nettoyés dans le nom du fichier !"
+                        "ℹ️ This PDF was not protected.\n\n✅ Usernames cleaned in filename!"
                     )
                     
                     # Puis envoyer le fichier
@@ -1139,7 +1232,7 @@ async def process_unlock(client, message, session, password):
                 logger.info(f"🔓 Decrypt result: {decrypt_result}")
                 
                 if not decrypt_result:
-                    await status.edit_text("❌ Mot de passe incorrect")
+                    await status.edit_text("❌ Incorrect password")
                     # Ne pas supprimer la session ici pour permettre de réessayer
                     return
                 
@@ -1189,7 +1282,7 @@ async def process_pages(client, message, session, pages_text):
             else:
                 pages_to_remove.add(int(part))
     except ValueError:
-        await status.edit_text("❌ Format invalide. Utilise: 1,3,5 ou 1-5")
+        await status.edit_text("❌ Invalid format. Use: 1,3,5 or 1-5")
         return
         
     try:
@@ -1202,7 +1295,7 @@ async def process_pages(client, message, session, pages_text):
                 reader = PdfReader(f)
                 
                 if reader.is_encrypted:
-                    await status.edit_text("🔐 Ce PDF est protégé. Envoie-moi le mot de passe:")
+                    await status.edit_text("🔐 This PDF is protected. Send me the password:")
                     session['awaiting_password_for_pages'] = True
                     session['pages_to_remove'] = pages_to_remove
                     return
@@ -1211,8 +1304,8 @@ async def process_pages(client, message, session, pages_text):
                 invalid = [p for p in pages_to_remove if p < 1 or p > total_pages]
                 if invalid:
                     await status.edit_text(
-                        f"❌ Pages invalides: {invalid}\n"
-                        f"Le PDF a {total_pages} pages"
+                        f"❌ Invalid pages: {invalid}\n"
+                        f"The PDF has {total_pages} pages"
                     )
                     return
                 writer = PdfWriter()
@@ -1226,13 +1319,13 @@ async def process_pages(client, message, session, pages_text):
                         kept += 1
                         
                 if kept == 0:
-                    # Aucune page supprimée : republie en nettoyant le nom du fichier
+                    # Aucune page supprimée : republier en nettoyant le nom du fichier
                     username = session.get('username', '')
                     cleaned_name = replace_username_in_filename(session['file_name'], username)
                     await status.delete()
-                    caption = "ℹ️ Aucune page n'a été supprimée.\n\n✅ Usernames nettoyés dans le nom du fichier !"
+                    caption = "ℹ️ No pages were removed.\n\n✅ Usernames cleaned in filename!"
                     if username:
-                        caption += f"\n\nUsername ajouté: {username}"
+                        caption += f"\n\nUsername added: {username}"
                     delay = session.get('delete_delay', AUTO_DELETE_DELAY)
                     await send_and_delete(client, message.chat.id, input_path, cleaned_name, caption, delay)
                     return
@@ -1242,10 +1335,10 @@ async def process_pages(client, message, session, pages_text):
                     
             await status.delete()
             
-            caption = f"{MESSAGES['success_pages']}\n\nPages supprimées: {sorted(pages_to_remove)}"
+            caption = f"{MESSAGES['success_pages']}\n\nRemoved pages: {sorted(pages_to_remove)}"
             username = session.get('username', '')
             if username:
-                caption += f"\n\nUsername ajouté: {username}"
+                caption += f"\n\nUsername added: {username}"
             
             new_file_name = replace_username_in_filename(session['file_name'], username)
             
@@ -1276,7 +1369,7 @@ async def process_both_password_received(client, message, session, password):
                 InlineKeyboardButton("The Last", callback_data=f"both_last:{message.from_user.id}"),
                 InlineKeyboardButton("The Middle", callback_data=f"both_middle:{message.from_user.id}")
             ],
-            [InlineKeyboardButton("📝 Saisir manuellement", callback_data=f"both_manual:{message.from_user.id}")]
+            [InlineKeyboardButton("📝 Enter manually", callback_data=f"both_manual:{message.from_user.id}")]
         ])
         
         session['both_password'] = password
@@ -1285,8 +1378,8 @@ async def process_both_password_received(client, message, session, password):
         
         await client.send_message(
             message.chat.id,
-            "✅ Mot de passe reçu!\n\n"
-            "**Étape 2/2 :** Choisis les pages à supprimer:",
+            "✅ Password received!\n\n"
+            "**Step 2/2:** Choose pages to remove:",
             reply_markup=keyboard
         )
 
@@ -1295,7 +1388,7 @@ async def process_both_with_pages(client, message, session):
     pages_text = session.get('both_pages')
     
     if not password:
-        await message.edit_message_text("❌ Erreur: mot de passe manquant")
+        await message.edit_message_text("❌ Error: missing password")
         return
     
     await process_both_final(client, message, session, password, pages_text)
@@ -1306,7 +1399,7 @@ async def process_both_final(client, message, session, password, pages_text):
     except:
         pass
     user_id = message.from_user.id
-    status = await client.send_message(message.chat.id, "🛠️ Traitement combiné en cours...")
+    status = await client.send_message(message.chat.id, "🛠️ Combined processing...")
     
     try:
         pages_to_remove = set()
@@ -1318,10 +1411,10 @@ async def process_both_final(client, message, session, password, pages_text):
                 
                 if reader.is_encrypted:
                     if password.lower() == 'none':
-                        await status.edit_text("❌ Le PDF est protégé mais tu as dit 'none'. Réessaie avec le bon mot de passe.")
+                        await status.edit_text("❌ PDF is protected but you said 'none'. Try again with the correct password.")
                         return
                     if not reader.decrypt(password):
-                        await status.edit_text("❌ Mot de passe incorrect")
+                        await status.edit_text("❌ Incorrect password")
                         return
                 
                 total_pages = len(reader.pages)
@@ -1340,7 +1433,7 @@ async def process_both_final(client, message, session, password, pages_text):
                     else:
                         pages_to_remove.add(int(part))
             except ValueError:
-                await status.edit_text("❌ Format invalide pour les pages. Utilise: 1,3,5 ou 1-5")
+                await status.edit_text("❌ Invalid page format. Use: 1,3,5 or 1-5")
                 return
         
         file = await client.download_media(session['file_id'], file_name=f"{get_user_temp_dir(user_id)}/input.pdf")
@@ -1354,19 +1447,19 @@ async def process_both_final(client, message, session, password, pages_text):
                 
                 if reader.is_encrypted:
                     if password.lower() == 'none':
-                        await status.edit_text("❌ Le PDF est protégé mais tu as dit 'none'. Réessaie avec le bon mot de passe.")
+                        await status.edit_text("❌ PDF is protected but you said 'none'. Try again with the correct password.")
                         return
                     if not reader.decrypt(password):
-                        await status.edit_text("❌ Mot de passe incorrect")
+                        await status.edit_text("❌ Incorrect password")
                         return
                 else:
                     # PDF n'est pas protégé : republier en nettoyant le nom du fichier
                     username = session.get('username', '')
                     cleaned_name = replace_username_in_filename(session['file_name'], username)
                     await status.delete()
-                    caption = "ℹ️ Ce PDF n'était pas protégé.\n\n✅ Usernames nettoyés dans le nom du fichier !"
+                    caption = "ℹ️ This PDF was not protected.\n\n✅ Usernames cleaned in filename!"
                     if username:
-                        caption += f"\n\nUsername ajouté: {username}"
+                        caption += f"\n\nUsername added: {username}"
                     delay = session.get('delete_delay', AUTO_DELETE_DELAY)
                     await send_and_delete(client, message.chat.id, input_path, cleaned_name, caption, delay)
                     return
@@ -1375,8 +1468,8 @@ async def process_both_final(client, message, session, password, pages_text):
                 invalid = [p for p in pages_to_remove if p < 1 or p > total_pages]
                 if invalid:
                     await status.edit_text(
-                        f"❌ Pages invalides: {invalid}\n"
-                        f"Le PDF a {total_pages} pages"
+                        f"❌ Invalid pages: {invalid}\n"
+                        f"The PDF has {total_pages} pages"
                     )
                     return
                 
@@ -1396,9 +1489,9 @@ async def process_both_final(client, message, session, password, pages_text):
                     username = session.get('username', '')
                     cleaned_name = replace_username_in_filename(session['file_name'], username)
                     await status.delete()
-                    caption = "ℹ️ Aucune page n'a été supprimée.\n\n✅ Usernames nettoyés dans le nom du fichier !"
+                    caption = "ℹ️ No pages were removed.\n\n✅ Usernames cleaned in filename!"
                     if username:
-                        caption += f"\n\nUsername ajouté: {username}"
+                        caption += f"\n\nUsername added: {username}"
                     delay = session.get('delete_delay', AUTO_DELETE_DELAY)
                     await send_and_delete(client, message.chat.id, input_path, cleaned_name, caption, delay)
                     return
@@ -1408,15 +1501,15 @@ async def process_both_final(client, message, session, password, pages_text):
             
             await status.delete()
             
-            caption = "✅ **The Both** - Traitement combiné terminé!\n\n"
+            caption = "✅ **The Both** - Combined processing complete!\n\n"
             username = session.get('username', '')
             if username:
-                caption += f"Username ajouté: {username}\n"
-            caption += f"Pages supprimées: {sorted(pages_to_remove)}\n"
-            caption += "• PDF déverrouillé (si protégé)\n"
-            caption += "• Pages supprimées\n"
-            caption += "• Nettoyage automatique des @username et hashtags\n"
-            caption += "• Username personnalisé ajouté"
+                caption += f"Username added: {username}\n"
+            caption += f"Removed pages: {sorted(pages_to_remove)}\n"
+            caption += "• PDF unlocked (if protected)\n"
+            caption += "• Pages removed\n"
+            caption += "• Auto-cleaned @username and hashtags\n"
+            caption += "• Custom username added"
             
             new_file_name = replace_username_in_filename(session['file_name'], username)
             
@@ -1448,15 +1541,15 @@ async def process_pages_with_password(client, message, session, password, pages_
                 reader = PdfReader(f)
                 
                 if not reader.decrypt(password):
-                    await status.edit_text("❌ Mot de passe incorrect")
+                    await status.edit_text("❌ Incorrect password")
                     return
                 
                 total_pages = len(reader.pages)
                 invalid = [p for p in pages_to_remove if p < 1 or p > total_pages]
                 if invalid:
                     await status.edit_text(
-                        f"❌ Pages invalides: {invalid}\n"
-                        f"Le PDF a {total_pages} pages"
+                        f"❌ Invalid pages: {invalid}\n"
+                        f"The PDF has {total_pages} pages"
                     )
                     return
                 writer = PdfWriter()
@@ -1473,9 +1566,9 @@ async def process_pages_with_password(client, message, session, password, pages_
                     username = session.get('username', '')
                     cleaned_name = replace_username_in_filename(session['file_name'], username)
                     await status.delete()
-                    caption = "ℹ️ Aucune page n'a été supprimée.\n\n✅ Usernames nettoyés dans le nom du fichier !"
+                    caption = "ℹ️ No pages were removed.\n\n✅ Usernames cleaned in filename!"
                     if username:
-                        caption += f"\n\nUsername ajouté: {username}"
+                        caption += f"\n\nUsername added: {username}"
                     delay = session.get('delete_delay', AUTO_DELETE_DELAY)
                     await send_and_delete(client, message.chat.id, input_path, cleaned_name, caption, delay)
                     return
@@ -1483,10 +1576,10 @@ async def process_pages_with_password(client, message, session, password, pages_
                     writer.write(out)
             await status.delete()
             
-            caption = f"{MESSAGES['success_pages']}\n\nPages supprimées: {sorted(pages_to_remove)}"
+            caption = f"{MESSAGES['success_pages']}\n\nRemoved pages: {sorted(pages_to_remove)}"
             username = session.get('username', '')
             if username:
-                caption += f"\n\nUsername ajouté: {username}"
+                caption += f"\n\nUsername added: {username}"
             
             new_file_name = replace_username_in_filename(session['file_name'], username)
             
@@ -1516,9 +1609,9 @@ async def process_clean_username(client, message, session):
     
     # Éditer le message des boutons au lieu d'envoyer un nouveau
     try:
-        await message.edit_message_text("🧹 Nettoyage des usernames...")
+        await message.edit_message_text("🧹 Cleaning usernames...")
     except:
-        status = await client.send_message(message.chat.id, "🧹 Nettoyage des usernames...")
+        status = await client.send_message(message.chat.id, "🧹 Cleaning usernames...")
     
     try:
         file = await client.download_media(session['file_id'], file_name=f"{get_user_temp_dir(user_id)}/input.pdf")
@@ -1551,7 +1644,7 @@ async def process_clean_username(client, message, session):
             # Envoyer le message de succès
             await client.send_message(
                 message.chat.id,
-                "✅ Usernames nettoyés dans le nom du fichier !"
+                "✅ Usernames cleaned in filename!"
             )
             
             # Envoyer le fichier
@@ -1571,20 +1664,20 @@ async def process_batch_clean(client, message, user_id):
     
     if not files:
         if hasattr(message, 'edit_message_text'):
-            await message.edit_message_text("❌ Aucun fichier dans le batch")
+            await message.edit_message_text("❌ No files in batch")
         else:
-            await client.send_message(message.chat.id, "❌ Aucun fichier dans le batch")
+            await client.send_message(message.chat.id, "❌ No files in batch")
         sessions[user_id]['processing'] = False
         return
     
     # Utiliser la fonction helper
-    status = await create_or_edit_status(client, message, f"🧹 Nettoyage des usernames sur {len(files)} fichiers...")
+    status = await create_or_edit_status(client, message, f"🧹 Cleaning usernames on {len(files)} files...")
     success_count = 0
     error_count = 0
     
     for i, file_info in enumerate(files):
         try:
-            await status.edit_text(f"🧹 Nettoyage fichier {i+1}/{len(files)}...")
+            await status.edit_text(f"🧹 Cleaning file {i+1}/{len(files)}...")
             
             file = await client.download_media(file_info['file_id'], file_name=f"{get_user_temp_dir(user_id)}/batch_{i}.pdf")
             
@@ -1618,9 +1711,9 @@ async def process_batch_clean(client, message, user_id):
             error_count += 1
     
     await status.edit_message_text(
-        f"✅ Nettoyage terminé!\n\n"
-        f"Réussis: {success_count}\n"
-        f"Erreurs: {error_count}"
+        f"✅ Cleaning complete!\n\n"
+        f"Successful: {success_count}\n"
+        f"Errors: {error_count}"
     )
     
     user_batches[user_id].clear()
@@ -1664,16 +1757,17 @@ async def cleanup_temp_files():
 
 # Lancement du bot
 if __name__ == "__main__":
-    print("🚀 Démarrage du bot PDF (Pyrogram) - VERSION CORRIGÉE")
-    print(f"🆔 PID du processus: {os.getpid()}")
-    print(f"⏰ Heure de démarrage: {datetime.now()}")
-    print("✅ Bot configuré et prêt!")
-    print("📌 Corrections appliquées:")
-    print("  - Protection anti-doublon globale")
-    print("  - Messages de succès avant envoi du fichier")
-    print("  - Suppression de session après traitement")
-    print("  - Pas de renvoi des boutons après action")
-    print("  - Pas de message de suppression dans la caption")
-    print("  - Bouton nettoyage nettoie ET ajoute le username")
+    print("🚀 Starting PDF Bot (Pyrogram) - ENGLISH VERSION WITH FORCE JOIN")
+    print(f"🆔 Process PID: {os.getpid()}")
+    print(f"⏰ Start time: {datetime.now()}")
+    print("✅ Bot configured and ready!")
+    print(f"📢 Force Join Channel: @{FORCE_JOIN_CHANNEL}")
+    print("📌 Features:")
+    print("  - Force join channel protection")
+    print("  - All messages in English")
+    print("  - Anti-duplicate global protection")
+    print("  - Success messages before file sending")
+    print("  - Session deletion after processing")
+    print("  - Clean button cleans AND adds username")
     
     app.run()
