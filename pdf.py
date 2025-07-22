@@ -13,6 +13,7 @@ import tempfile
 import re
 import asyncio
 import shutil
+import json
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -26,6 +27,64 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = os.getenv("ADMIN_IDS")
+
+# Fichier pour stocker les usernames de manière persistante
+USERNAMES_FILE = Path("usernames.json")
+
+def save_username(user_id, username):
+    """Sauvegarde le username d'un utilisateur de manière persistante"""
+    try:
+        # Charger les données existantes
+        if USERNAMES_FILE.exists():
+            with open(USERNAMES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            data = {}
+        
+        # Ajouter/mettre à jour le username
+        data[str(user_id)] = username
+        
+        # Sauvegarder
+        with open(USERNAMES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        
+        logger.info(f"💾 Username sauvegardé pour user {user_id}: {username}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Erreur sauvegarde username: {e}")
+        return False
+
+def get_saved_username(user_id):
+    """Récupère le username sauvegardé d'un utilisateur"""
+    try:
+        if USERNAMES_FILE.exists():
+            with open(USERNAMES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get(str(user_id))
+        return None
+    except Exception as e:
+        logger.error(f"❌ Erreur lecture username: {e}")
+        return None
+
+def delete_saved_username(user_id):
+    """Supprime le username sauvegardé d'un utilisateur"""
+    try:
+        if USERNAMES_FILE.exists():
+            with open(USERNAMES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            if str(user_id) in data:
+                del data[str(user_id)]
+                
+                with open(USERNAMES_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                
+                logger.info(f"🗑️ Username supprimé pour user {user_id}")
+                return True
+        return False
+    except Exception as e:
+        logger.error(f"❌ Erreur suppression username: {e}")
+        return False
 
 # 🔥 CONFIGURATION FORCE JOIN CHANNEL 🔥
 FORCE_JOIN_CHANNEL = "djd208"  # ⚠️ REMPLACE PAR TON CANAL (sans @)
@@ -251,6 +310,10 @@ async def send_and_delete(client, chat_id, file_path, file_name, caption=None, d
         logger.info(f"📤 send_and_delete - Fichier: {file_path} - Existe: {os.path.exists(file_path)}")
         logger.info(f"📤 send_and_delete - Chat: {chat_id} - Nom: {file_name} - Délai: {delay_seconds}")
         
+        # NOUVEAU: Marquer qu'on vient de traiter un fichier
+        if chat_id in sessions:
+            sessions[chat_id]['just_processed'] = True
+        
         with open(file_path, 'rb') as f:
             # Ici on ne rajoute pas la phrase de suppression à la caption !
             sent = await client.send_document(
@@ -258,6 +321,7 @@ async def send_and_delete(client, chat_id, file_path, file_name, caption=None, d
                 document=f,
                 file_name=file_name,
                 caption=caption or ""
+                # PAS de reply_markup=keyboard ici !
             )
             logger.info(f"✅ Document envoyé avec succès - ID: {sent.id}")
 
@@ -281,6 +345,14 @@ async def send_and_delete(client, chat_id, file_path, file_name, caption=None, d
 
     except Exception as e:
         logger.error(f"Erreur send_and_delete: {e}")
+    finally:
+        # NOUVEAU: Réinitialiser le flag après un court délai
+        async def reset_flag():
+            await asyncio.sleep(1)  # Attendre 1 seconde
+            if chat_id in sessions:
+                sessions[chat_id]['just_processed'] = False
+        
+        asyncio.create_task(reset_flag())
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
@@ -308,16 +380,20 @@ async def start_handler(client, message: Message):
         cleanup_task_started = True
         logger.info("Tâche de nettoyage périodique démarrée")
     
+    # NOUVEAU: Charger le username sauvegardé
+    saved_username = get_saved_username(user_id)
+    
     # Réinitialiser complètement la session
-    username = sessions.get(user_id, {}).get('username')
     delete_delay = sessions.get(user_id, {}).get('delete_delay', AUTO_DELETE_DELAY)
     
     user_batches[user_id].clear()
     sessions[user_id] = {}
     
-    # Restaurer les paramètres
-    if username:
-        sessions[user_id]['username'] = username
+    # NOUVEAU: Restaurer le username depuis le fichier
+    if saved_username:
+        sessions[user_id]['username'] = saved_username
+        logger.info(f"📂 Username restauré depuis le fichier pour user {user_id}: {saved_username}")
+    
     if delete_delay != AUTO_DELETE_DELAY:
         sessions[user_id]['delete_delay'] = delete_delay
     
@@ -424,6 +500,17 @@ async def process_batch_command(client, message: Message):
 async def handle_document(client, message: Message):
     user_id = message.from_user.id
     
+    # NOUVEAU: Ignorer si c'est le bot qui envoie (ses propres fichiers traités)
+    if message.from_user.is_bot:
+        logger.info(f"Document ignoré - envoyé par le bot lui-même")
+        return
+    
+    # NOUVEAU: Ignorer si on vient de traiter un fichier
+    if sessions.get(user_id, {}).get('just_processed'):
+        logger.info(f"Document ignoré - fichier vient d'être traité")
+        sessions[user_id]['just_processed'] = False
+        return
+    
     # 🔥 VÉRIFICATION FORCE JOIN 🔥
     if not await is_user_in_channel(user_id):
         await send_force_join_message(client, message)
@@ -476,8 +563,8 @@ async def handle_document(client, message: Message):
     if user_id not in sessions:
         sessions[user_id] = {}
     
-    # Conserver username et delete_delay
-    username = sessions[user_id].get('username')
+    # NOUVEAU: Charger le username depuis le fichier persistant
+    saved_username = get_saved_username(user_id)
     delete_delay = sessions[user_id].get('delete_delay', AUTO_DELETE_DELAY)
     
     sessions[user_id] = {
@@ -486,9 +573,9 @@ async def handle_document(client, message: Message):
         'last_activity': datetime.now()
     }
     
-    # Restaurer les paramètres
-    if username:
-        sessions[user_id]['username'] = username
+    # NOUVEAU: Restaurer le username depuis le fichier
+    if saved_username:
+        sessions[user_id]['username'] = saved_username
     if delete_delay != AUTO_DELETE_DELAY:
         sessions[user_id]['delete_delay'] = delete_delay
     
@@ -754,6 +841,10 @@ async def button_callback(client, query: CallbackQuery):
         if sessions[user_id].get('username'):
             old_username = sessions[user_id]['username']
             sessions[user_id].pop('username')
+            
+            # NOUVEAU: Supprimer aussi du fichier persistant
+            delete_saved_username(user_id)
+            
             await query.edit_message_text(f"✅ Username deleted: {old_username}")
             logger.info(f"🔍 Username supprimé pour user {user_id}: {old_username}")
         else:
@@ -926,10 +1017,17 @@ async def handle_all_text(client, message: Message):
         username = message.text.strip()
         match = re.search(r'@[\w\d_]+', username)
         if match:
-            session['username'] = match.group()
+            username_clean = match.group()
+            session['username'] = username_clean
             session['awaiting_username'] = False
-            await client.send_message(message.chat.id, f"✅ Username saved: {session['username']}")
-            logger.info(f"🔧 Username enregistré pour user {user_id}: {session['username']}")
+            
+            # NOUVEAU: Sauvegarder de manière persistante
+            if save_username(user_id, username_clean):
+                await client.send_message(message.chat.id, f"✅ Username saved: {username_clean}")
+            else:
+                await client.send_message(message.chat.id, f"✅ Username saved in session: {username_clean}\n⚠️ (Could not save to file)")
+            
+            logger.info(f"🔧 Username enregistré pour user {user_id}: {username_clean}")
         else:
             await client.send_message(message.chat.id, "❌ No valid @username found in your text. Try again.")
         return
