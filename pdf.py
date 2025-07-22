@@ -939,16 +939,24 @@ async def button_callback(client, query: CallbackQuery):
         os.remove(file)  # Nettoyer immédiatement
         await process_pages(client, query.message, sessions[user_id], str(middle))
     elif action == "both_first":
+        logger.info(f"🎯 Both first clicked for user {user_id}")
         sessions[user_id]['both_pages'] = "1"
+        sessions[user_id]['processing'] = False  # Libérer le flag
         await process_both_with_pages(client, query.message, sessions[user_id])
     elif action == "both_last":
+        logger.info(f"🎯 Both last clicked for user {user_id}")
         sessions[user_id]['both_pages'] = "last"
+        sessions[user_id]['processing'] = False  # Libérer le flag
         await process_both_with_pages(client, query.message, sessions[user_id])
     elif action == "both_middle":
+        logger.info(f"🎯 Both middle clicked for user {user_id}")
         sessions[user_id]['both_pages'] = "middle"
+        sessions[user_id]['processing'] = False  # Libérer le flag
         await process_both_with_pages(client, query.message, sessions[user_id])
     elif action == "both_manual":
+        logger.info(f"🎯 Both manual clicked for user {user_id}")
         sessions[user_id]['awaiting_both_pages'] = True
+        sessions[user_id]['processing'] = False  # Libérer le flag
         await query.edit_message_text(
             "📝 **Manual page entry**\n\n"
             "Send me the pages to remove:\n"
@@ -1521,6 +1529,7 @@ async def process_both_password_received(client, message, session, password):
         )
 
 async def process_both_with_pages(client, message, session):
+    """Traite l'opération Both après sélection des pages"""
     password = session.get('both_password')
     pages_text = session.get('both_pages')
     
