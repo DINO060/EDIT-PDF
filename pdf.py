@@ -35,22 +35,14 @@ AUTO_DELETE_DELAY = 300  # 5 minutes
 
 # Messages du bot en anglais
 MESSAGES = {
-    'start': "🤖 PDF Manager Bot ready!\n\n📄 **Normal Mode**: Send a PDF to process it\n📦 **Batch Mode**: Process up to 24 files at once with `/batch`\n\nSend me a PDF to get started!",
-    'not_pdf': "❌ This is not a PDF file!",
-    'file_too_big': "❌ File is too large!",
-    'processing': "⏳ Processing...",
-    'success_unlock': "✅ PDF unlocked successfully!",
-    'success_pages': "✅ Pages removed successfully!",
-    'error': "❌ Error during processing",
-    'force_join': """🚫 *Access Denied!*
-
-To use this bot, you must first join our official channel:
-👉 @{channel}
-
-✅ Click the button below to join.
-Once done, click \"I have joined\" to continue.
-
-_Thank you for your support! 💙_"""
+    'start': "🤖 *PDF Manager Bot ready!*\n\n📄 *Normal Mode*: Send a PDF to process it\n📦 *Batch Mode*: Process up to 24 files at once with `/batch`\n\nSend me a PDF to get started!",
+    'not_pdf': "❌ *This is not a PDF file!*",
+    'file_too_big': "❌ *File is too large!*",
+    'processing': "⏳ _Processing..._",
+    'success_unlock': "✅ *PDF unlocked successfully!*",
+    'success_pages': "✅ *Pages removed successfully!*",
+    'error': "❌ *Error during processing*",
+    'force_join': """🚫 *Access Denied!*\n\nTo use this bot, you must first join our official channel:\n👉 @{channel}\n\n✅ Click the button below to join.\nOnce done, click \"I have joined\" to continue.\n\n_Thank you for your support! 💙_"""
 }
 
 # Surcharger avec les messages de config.py s'ils existent
