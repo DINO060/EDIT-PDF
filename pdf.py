@@ -22,17 +22,25 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import UserNotParticipant, ChatAdminRequired, UsernameNotOccupied
 from pyrogram.enums import ChatMemberStatus
+
 # Import de la configuration
-try:
-    from config import API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS
-except ImportError:
-    print("❌ ERREUR: Fichier config.py manquant!")
-    print("Veuillez créer le fichier config.py avec vos clés API")
-    print("Exemple basé sur config_example.py:")
-    print("  API_ID = 12345678")
-    print("  API_HASH = 'abcdef1234567890abcdef1234567890'")
-    print("  BOT_TOKEN = '1234567890:ABCdefGHIjklMNOpqrsTUVwxyz'")
-    sys.exit(1)
+def get_env_or_config(attr, default=None):
+    value = os.environ.get(attr)
+    if value is not None:
+        if attr == "API_ID":
+            return int(value)
+        return value
+    try:
+        from config import API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS
+        return locals()[attr]
+    except Exception:
+        return default
+
+API_ID = get_env_or_config("API_ID")
+API_HASH = get_env_or_config("API_HASH")
+BOT_TOKEN = get_env_or_config("BOT_TOKEN")
+ADMIN_IDS = get_env_or_config("ADMIN_IDS", "")
+
 
 # Fichier pour stocker les usernames de manière persistante
 USERNAMES_FILE = Path("usernames.json")
