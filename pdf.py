@@ -22,13 +22,13 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import UserNotParticipant, ChatAdminRequired, UsernameNotOccupied
 from pyrogram.enums import ChatMemberStatus
-from config.settings import API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS
+#from config.settings import API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS
 
-# Import de la configuration
-# API_ID = int(os.getenv("API_ID"))
-# API_HASH = os.getenv("API_HASH")
-# BOT_TOKEN = os.getenv("BOT_TOKEN")
-# ADMIN_IDS = os.getenv("ADMIN_IDS")
+ #Import de la configuration
+ API_ID = int(os.getenv("API_ID"))
+ API_HASH = os.getenv("API_HASH")
+ BOT_TOKEN = os.getenv("BOT_TOKEN")
+ ADMIN_IDS = os.getenv("ADMIN_IDS")
 
 # Fichier pour stocker les usernames de manière persistante
 USERNAMES_FILE = Path("usernames.json")
