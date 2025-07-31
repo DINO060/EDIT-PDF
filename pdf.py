@@ -1,4 +1,3 @@
-#!/usr/bin/env python3 
 """
 Bot Telegram pour la gestion des PDF - VERSION CORRIGÉE
 Compatible avec Python 3.13 et python-telegram-bot 21.x
@@ -46,10 +45,32 @@ ADMIN_IDS = get_env_or_config("ADMIN_IDS", "")
 # Fichier pour stocker les usernames de manière persistante
 USERNAMES_FILE = Path("usernames.json")
 
+# Username par défaut à ajouter à la fin des captions
+DEFAULT_USERNAME_TAG = "@PdfBot"  # Changez selon votre bot
+
 def is_supported_video(filename):
     """Détecte si le fichier est une vidéo supportée"""
     mimetype, _ = mimetypes.guess_type(filename)
     return mimetype and mimetype.startswith("video/")
+
+def clean_caption_with_username(original_caption: str, user_id: int = None) -> str:
+    """Nettoie la caption et ajoute le username sauvegardé de l'utilisateur à la fin"""
+    # Supprimer tous les @usernames existants
+    cleaned = re.sub(r"@[\w_]+", "", original_caption).strip()
+    
+    # Supprimer les espaces doublés
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    
+    # Récupérer le username sauvegardé de l'utilisateur
+    if user_id:
+        saved_username = get_saved_username(user_id)
+        if saved_username:
+            # Ajouter le username sauvegardé à la fin
+            final_caption = f"{cleaned} {saved_username}".strip()
+            return final_caption
+    
+    # Si pas de username sauvegardé, retourner juste le texte nettoyé
+    return cleaned
 
 def is_pdf_file(filename):
     """Détecte si le fichier est un PDF"""
@@ -160,7 +181,15 @@ user_last_command = {}  # {user_id: (command, timestamp)}
 user_actions = defaultdict(list)  # Pour le rate limiting
 
 def check_rate_limit(user_id):
-    """Vérifie si l'utilisateur n'abuse pas (max 5 actions par minute)"""
+    """Vérifie si l'utilisateur n'abuse pas"""
+    # 🔥 Si l'utilisateur est en mode batch, augmenter la limite
+    session = sessions.get(user_id, {})
+    if session.get('batch_mode'):
+        # En mode batch, permettre jusqu'à 100 actions par minute
+        rate_limit = 100
+    else:
+        rate_limit = 30
+    
     current_time = datetime.now()
     # Nettoyer les anciennes actions
     user_actions[user_id] = [
@@ -168,7 +197,7 @@ def check_rate_limit(user_id):
         if (current_time - t).seconds < 60
     ]
     
-    if len(user_actions[user_id]) >= 5:
+    if len(user_actions[user_id]) >= rate_limit:
         logger.warning(f"⚠️ Rate limit atteint pour user {user_id}")
         return False  # Trop d'actions
     
@@ -181,7 +210,7 @@ def is_duplicate_message(user_id, message_id, command_type="message"):
     
     # Vérifier le rate limit
     if not check_rate_limit(user_id):
-        return True
+        return "rate_limit"
     
     # Protection contre les commandes répétées (même utilisateur, même commande, < 2 secondes)
     if command_type in ["start", "batch", "process"]:
@@ -205,59 +234,45 @@ def is_duplicate_message(user_id, message_id, command_type="message"):
     
     # Vérifier si le message est un doublon
     if key in processed_messages:
-        return True
+        return "duplicate"
     
     processed_messages[key] = current_time
     return False
 
+async def send_limit_message(client, chat_id, limit_type):
+    """Envoie un message d'information selon le type de limite atteinte"""
+    if limit_type == "rate_limit":
+        await client.send_message(
+            chat_id,
+            "⛔️ **Limite atteinte** : Tu ne peux envoyer que 30 fichiers par minute.\n\n"
+            "⏰ Réessaie dans quelques secondes."
+        )
+    elif limit_type == "duplicate":
+        await client.send_message(
+            chat_id,
+            "⚠️ **Fichier déjà traité** : Ce fichier a déjà été traité récemment.\n\n"
+            "⏰ Attends 5 minutes avant de le renvoyer."
+        )
+
 def reset_session_flags(user_id):
-    """Réinitialise tous les flags temporaires d'une session SAUF les données importantes"""
-    logger.info(f"🔄 DEBUG: reset_session_flags called for user {user_id}")
-    
-    if user_id not in sessions:
-        logger.info(f"🔄 DEBUG: No session exists for user {user_id}, nothing to reset")
-        return
-    
-    session = sessions[user_id]
-    if not isinstance(session, dict):
-        logger.warning(f"⚠️ Session inattendue pour user {user_id}: {type(session)} = {session} (réinitialisation)")
-        sessions[user_id] = {}
-        return
-    
-    # Log l'état avant reset
-    logger.info(f"🔄 DEBUG: Session keys before reset: {list(session.keys())}")
-    logger.info(f"🔄 DEBUG: Has batch_both_password before reset: {'batch_both_password' in session}")
-    
-    # IMPORTANT: NE PAS supprimer les données critiques
-    flags_to_reset = [
-        'awaiting_pages_manual', 
-        'awaiting_both_pages', 
-        'awaiting_both_password',
-        'awaiting_password_for_pages', 
-        'awaiting_batch_password', 
-        'awaiting_batch_both_password',
-        'awaiting_batch_both_pages', 
-        # 'batch_both_password',  # ❌ NE PAS supprimer le mot de passe !
-        # 'both_password',        # ❌ NE PAS supprimer le mot de passe !
-        'pages_to_remove', 
-        'both_pages', 
-        'awaiting_username', 
-        'batch_command_processing',
-        'process_command_processing', 
-        'cleaning_only', 
-        'awaiting_both_pages_selection'
-    ]
-    
-    for flag in flags_to_reset:
-        if flag in session:
-            logger.info(f"🔄 DEBUG: Removing flag: {flag}")
-            session.pop(flag, None)
-    
-    # Log l'état après reset
-    logger.info(f"🔄 DEBUG: Session keys after reset: {list(session.keys())}")
-    logger.info(f"🔄 DEBUG: Has batch_both_password after reset: {'batch_both_password' in session}")
-    
-    logger.info(f"✅ Flags de session réinitialisés pour user {user_id}")
+    """Réinitialise tous les flags de session pour un utilisateur"""
+    if user_id in sessions:
+        sessions[user_id].pop('just_processed', None)
+        sessions[user_id].pop('processing', None)
+        sessions[user_id].pop('batch_mode', None)
+
+async def set_just_processed_flag(user_id, delay=1):
+    """Marque qu'un fichier vient d'être traité et réinitialise le flag après un délai"""
+    if user_id in sessions:
+        sessions[user_id]['just_processed'] = True
+        
+        # Réinitialiser le flag après le délai
+        async def reset_flag():
+            await asyncio.sleep(delay)
+            if user_id in sessions:
+                sessions[user_id]['just_processed'] = False
+        
+        asyncio.create_task(reset_flag())
 
 app = Client(
     "pdfbot",
@@ -403,9 +418,8 @@ async def send_and_delete(client, chat_id, file_path, file_name, caption=None, d
         logger.info(f"📤 send_and_delete - Fichier: {file_path} - Existe: {os.path.exists(file_path)}")
         logger.info(f"📤 send_and_delete - Chat: {chat_id} - Nom: {file_name} - Délai: {delay_seconds}")
         
-        # NOUVEAU: Marquer qu'on vient de traiter un fichier
-        if chat_id in sessions:
-            sessions[chat_id]['just_processed'] = True
+        # Marquer qu'on vient de traiter un fichier
+        await set_just_processed_flag(chat_id)
         
         with open(file_path, 'rb') as f:
             # Ici on ne rajoute pas la phrase de suppression à la caption !
@@ -439,13 +453,8 @@ async def send_and_delete(client, chat_id, file_path, file_name, caption=None, d
     except Exception as e:
         logger.error(f"Error send_and_delete: {e}")
     finally:
-        # NOUVEAU: Réinitialiser le flag après un court délai
-        async def reset_flag():
-            await asyncio.sleep(1)  # Attendre 1 seconde
-            if chat_id in sessions:
-                sessions[chat_id]['just_processed'] = False
-        
-        asyncio.create_task(reset_flag())
+        # Le flag est géré par set_just_processed_flag
+        pass
 
 async def send_optimized_pdf(client, chat_id, original_file_path, new_file_name, caption=None, delay_seconds=AUTO_DELETE_DELAY):
     """
@@ -476,6 +485,10 @@ async def start_handler(client, message: Message):
     global cleanup_task_started
     user_id = message.from_user.id
     
+    # S'assurer que la session existe et mettre à jour l'activité
+    session = ensure_session_dict(user_id)
+    session['last_activity'] = datetime.now()
+    
     # 🔥 VÉRIFICATION FORCE JOIN 🔥
     if not await is_user_in_channel(user_id):
         await send_force_join_message(client, message)
@@ -496,9 +509,14 @@ async def start_handler(client, message: Message):
     # DEBUG EXPRESS - Vérifier les doubles instances
     print(f"DEBUG START: Appel handler /start pour user {user_id} à {datetime.now()}")
     
-    # Protection anti-doublon
-    if is_duplicate_message(user_id, message.id, "start"):
-        logger.info(f"Start ignoré - message dupliqué pour user {user_id}")
+    # Protection anti-doublon et rate limit
+    duplicate_check = is_duplicate_message(user_id, message.id, "start")
+    if duplicate_check:
+        if duplicate_check == "rate_limit":
+            await send_limit_message(client, message.chat.id, "rate_limit")
+        elif duplicate_check == "duplicate":
+            await send_limit_message(client, message.chat.id, "duplicate")
+        logger.info(f"Start command ignored - {duplicate_check} for user {user_id}")
         return
     
     logger.info(f"Start command received from user {user_id}")
@@ -513,18 +531,18 @@ async def start_handler(client, message: Message):
     saved_username = get_saved_username(user_id)
     
     # Réinitialiser complètement la session
-    delete_delay = sessions.get(user_id, {}).get('delete_delay', AUTO_DELETE_DELAY)
+    delete_delay = session.get('delete_delay', AUTO_DELETE_DELAY)
     
     user_batches[user_id].clear()
-    sessions[user_id] = {}
+    session.clear()
     
     # NOUVEAU: Restaurer le username depuis le fichier
     if saved_username:
-        sessions[user_id]['username'] = saved_username
+        session['username'] = saved_username
         logger.info(f"📂 Username restored from file for user {user_id}: {saved_username}")
     
     if delete_delay != AUTO_DELETE_DELAY:
-        sessions[user_id]['delete_delay'] = delete_delay
+        session['delete_delay'] = delete_delay
     
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
@@ -537,25 +555,36 @@ async def start_handler(client, message: Message):
 async def batch_command(client, message: Message):
     user_id = message.from_user.id
     
+    # S'assurer que la session existe et mettre à jour l'activité
+    session = ensure_session_dict(user_id)
+    session['last_activity'] = datetime.now()
+    
     # 🔥 VÉRIFICATION FORCE JOIN 🔥
     if not await is_user_in_channel(user_id):
         await send_force_join_message(client, message)
         return
     
-    # Protection anti-doublon
-    if is_duplicate_message(user_id, message.id, "batch"):
-        logger.info(f"Batch ignoré - message dupliqué pour user {user_id}")
+    # Protection anti-doublon et rate limit
+    duplicate_check = is_duplicate_message(user_id, message.id, "batch")
+    if duplicate_check:
+        if duplicate_check == "rate_limit":
+            await send_limit_message(client, message.chat.id, "rate_limit")
+        elif duplicate_check == "duplicate":
+            await send_limit_message(client, message.chat.id, "duplicate")
+        logger.info(f"Batch command ignored - {duplicate_check} for user {user_id}")
         return
     
     logger.info(f"🔍 batch_command appelé - User {user_id} - Time: {datetime.now()}")
     
     # Protection contre les doubles appels
-    if sessions.get(user_id, {}).get('batch_command_processing'):
+    if session.get('batch_command_processing'):
         logger.info(f"🔍 batch_command ignoré - déjà en cours pour user {user_id}")
         return
     
-    sessions[user_id] = sessions.get(user_id, {})
-    sessions[user_id]['batch_command_processing'] = True
+    session['batch_command_processing'] = True
+    
+    # 🔥 IMPORTANT: Activer le mode batch
+    session['batch_mode'] = True
     
     # Vérifier l'existence de user_batches[user_id]
     if user_id not in user_batches:
@@ -566,20 +595,26 @@ async def batch_command(client, message: Message):
         await client.send_message(
             message.chat.id,
             f"📦 **Batch Mode**\n\n"
-            f"You have {count} file(s) waiting.\n"
-            f"Maximum: {MAX_BATCH_FILES} files\n\n"
-            f"Send `/process` to process all files"
+            f"✅ You have {count} file(s) waiting\n"
+            f"📊 Maximum: {MAX_BATCH_FILES} files\n\n"
+            f"🎥 Videos are downloaded immediately to avoid session expiration\n"
+            f"📄 PDFs will be processed when you send `/process`\n\n"
+            f"🔄 Send `/process` to process all files"
         )
     else:
         await client.send_message(
             message.chat.id,
             f"📦 **Batch Mode**\n\n"
-            f"No files waiting.\n"
-            f"Send up to {MAX_BATCH_FILES} PDF files then `/process`"
+            f"📭 No files waiting\n\n"
+            f"✅ You can send up to {MAX_BATCH_FILES} files\n"
+            f"🎥 Videos will be downloaded immediately to avoid session expiration\n"
+            f"📄 PDFs will be processed when you send `/process`\n\n"
+            f"⏰ **Important**: Videos must be processed within 1-2 minutes of sending\n"
+            f"🔄 Send `/process` when you're done adding files"
         )
     
     # Libérer le flag
-    sessions[user_id]['batch_command_processing'] = False
+    session['batch_command_processing'] = False
 
 @app.on_message(filters.command("process") & filters.private)
 async def process_batch_command(client, message: Message):
@@ -590,112 +625,152 @@ async def process_batch_command(client, message: Message):
         await send_force_join_message(client, message)
         return
     
-    if user_id not in user_batches or not user_batches[user_id]:
-        await client.send_message(message.chat.id, "❌ No files in batch. Send files first.")
+    # Protection anti-doublon et rate limit
+    duplicate_check = is_duplicate_message(user_id, message.id, "process")
+    if duplicate_check:
+        if duplicate_check == "rate_limit":
+            await send_limit_message(client, message.chat.id, "rate_limit")
+        elif duplicate_check == "duplicate":
+            await send_limit_message(client, message.chat.id, "duplicate")
+        logger.info(f"Process command ignored - {duplicate_check} for user {user_id}")
         return
     
-    files = user_batches[user_id]
+    logger.info(f"🔍 process_batch_command appelé - User {user_id} - Time: {datetime.now()}")
     
-    # Vérifier s'il y a des vidéos dans le batch
-    videos = [f for f in files if f.get('is_video')]
-    pdfs = [f for f in files if not f.get('is_video')]
+    # Protection contre les doubles appels
+    if sessions.get(user_id, {}).get('process_command_processing'):
+        logger.info(f"🔍 process_batch_command ignoré - déjà en cours pour user {user_id}")
+        return
     
-    if videos and not pdfs:
-        # Seulement des vidéos - traitement rapide
-        await process_batch_videos_caption(client, message, user_id)
+    sessions[user_id] = sessions.get(user_id, {})
+    sessions[user_id]['process_command_processing'] = True
+    
+    # Vérifier l'existence de user_batches[user_id]
+    if user_id not in user_batches:
+        user_batches[user_id] = []
+    
+    # 🔥 LOG DEBUG
+    logger.info(f"📦 BATCH STATUS: User {user_id} has {len(user_batches[user_id])} files in batch")
+    
+    batch_files = user_batches[user_id]
+    if not batch_files:
+        await client.send_message(message.chat.id, "❌ No files waiting in the batch")
+        sessions[user_id]['process_command_processing'] = False
         return
-    elif videos and pdfs:
-        # Mix de vidéos et PDFs - traiter séparément
-        await message.reply("🔄 Processing mixed batch (videos + PDFs)...")
-        
-        # Traiter les vidéos d'abord
-        if videos:
-            await process_batch_videos_caption(client, message, user_id)
-        
-        # Traiter les PDFs ensuite
-        if pdfs:
-            # Créer un batch temporaire avec seulement les PDFs
-            temp_batch = pdfs
-            user_batches[user_id] = temp_batch
-            
-            # Continuer avec le traitement PDF normal
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🧹 Clean usernames", callback_data=f"batch_clean:{user_id}")],
-                [InlineKeyboardButton("🔓 Unlock", callback_data=f"batch_unlock:{user_id}")],
-                [InlineKeyboardButton("🗑️ Remove pages", callback_data=f"batch_pages:{user_id}")],
-                [InlineKeyboardButton("🛠️ The Both", callback_data=f"batch_both:{user_id}")],
-                [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")]
-            ])
-            
-            await message.edit_text(
-                f"📦 **Batch Processing**\n\n"
-                f"PDF files: {len(pdfs)}\n"
-                f"Choose an action:",
-                reply_markup=keyboard
-            )
-        return
-    else:
-        # Seulement des PDFs - traitement normal
+    
+    # 1️⃣ D'abord : traiter toutes les vidéos du batch
+    for entry in batch_files[:]:  # [:] fait une copie pour suppression sûre
+        if entry.get('is_video'):
+            file_id = entry['file_id']
+            original_caption = entry.get('caption', '') or entry.get('file_name', '')
+            # Nettoyer la caption + username personnalisé
+            final_caption = clean_caption_with_username(original_caption, user_id)
+            try:
+                sent = await client.send_video(
+                    chat_id=message.chat.id,
+                    video=file_id,
+                    caption=final_caption
+                )
+                delay = sessions.get(user_id, {}).get('delete_delay', AUTO_DELETE_DELAY)
+                if delay > 0:
+                    async def delete_after_delay():
+                        await asyncio.sleep(delay)
+                        try:
+                            await sent.delete()
+                        except Exception:
+                            pass
+                    asyncio.create_task(delete_after_delay())
+            except Exception as e:
+                await client.send_message(message.chat.id, f"❌ Error sending video: {str(e)}")
+            # Supprimer la vidéo traitée du batch
+            batch_files.remove(entry)
+
+    # 2️⃣ Ensuite : afficher le menu si des PDF restent dans le batch
+    pdf_files = [f for f in batch_files if not f.get('is_video')]
+    if pdf_files:
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🧹 Clean usernames", callback_data=f"batch_clean:{user_id}")],
-            [InlineKeyboardButton("🔓 Unlock", callback_data=f"batch_unlock:{user_id}")],
-            [InlineKeyboardButton("🗑️ Remove pages", callback_data=f"batch_pages:{user_id}")],
-            [InlineKeyboardButton("🛠️ The Both", callback_data=f"batch_both:{user_id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")]
+            [InlineKeyboardButton("🧹 Clean usernames (all)", callback_data=f"batch_clean:{user_id}")],
+            [InlineKeyboardButton("🔓 Unlock all", callback_data=f"batch_unlock:{user_id}")],
+            [InlineKeyboardButton("🗑️ Remove pages (all)", callback_data=f"batch_pages:{user_id}")],
+            [InlineKeyboardButton("🛠️ The Both (all)", callback_data=f"batch_both:{user_id}")],
+            [InlineKeyboardButton("🧹 Clear batch", callback_data=f"batch_clear:{user_id}")]
         ])
-        
-        await message.edit_text(
+        await client.send_message(
+            message.chat.id,
             f"📦 **Batch Processing**\n\n"
-            f"Files: {len(files)}\n"
-            f"Choose an action:",
+            f"{len(pdf_files)} PDF(s) ready\n\n"
+            f"What do you want to do?",
             reply_markup=keyboard
         )
+        sessions[user_id]['process_command_processing'] = False
+        return
+
+    # 3️⃣ S'il ne reste plus de PDF ni vidéo : tout a été traité
+    await client.send_message(
+        message.chat.id,
+        "✅ All videos processed!\n\nSend more files or /start to exit batch mode."
+    )
+    user_batches[user_id].clear()
+    sessions[user_id]['process_command_processing'] = False
 
 @app.on_message(filters.document & filters.private)
 async def handle_document(client, message: Message):
     user_id = message.from_user.id
     
-    # NOUVEAU: Ignorer si c'est le bot qui envoie (ses propres fichiers traités)
+    # S'assurer que la session existe et mettre à jour l'activité
+    session = ensure_session_dict(user_id)
+    session['last_activity'] = datetime.now()
+    
+    # NOUVEAU: Ignorer si c'est le bot qui envoie
     if message.from_user.is_bot:
         logger.info(f"Document ignored - sent by the bot itself")
         return
     
-    # NOUVEAU: Ignorer si on vient de traiter un fichier
-    if sessions.get(user_id, {}).get('just_processed'):
-        logger.info(f"Document ignored - file was just processed")
-        sessions[user_id]['just_processed'] = False
-        return
+    # 🔥 CORRECTION BATCH: Ne pas bloquer en mode batch
+    if not session.get('batch_mode'):
+        # NOUVEAU: Ignorer si on vient de traiter un fichier (MODE NORMAL SEULEMENT)
+        if session.get('just_processed'):
+            logger.info(f"Document ignored - file was just processed")
+            session['just_processed'] = False
+            return
+        
+        # Vérifier si on traite déjà quelque chose (MODE NORMAL SEULEMENT)
+        if session.get('processing'):
+            logger.info(f"Document ignored - processing in progress for user {user_id}")
+            return
     
     # 🔥 VÉRIFICATION FORCE JOIN 🔥
     if not await is_user_in_channel(user_id):
         await send_force_join_message(client, message)
         return
     
-    # Protection anti-doublon
-    if is_duplicate_message(user_id, message.id, "document"):
-        logger.info(f"Document ignored - duplicate message for user {user_id}")
-        return
-    
-    # Vérifier si on traite déjà quelque chose
-    if sessions.get(user_id, {}).get('processing'):
-        logger.info(f"Document ignored - processing in progress for user {user_id}")
-        return
+    # Protection anti-doublon et rate limit - AJUSTÉE POUR BATCH
+    if not session.get('batch_mode'):
+        duplicate_check = is_duplicate_message(user_id, message.id, "document")
+        if duplicate_check:
+            if duplicate_check == "rate_limit":
+                await send_limit_message(client, message.chat.id, "rate_limit")
+            elif duplicate_check == "duplicate":
+                await send_limit_message(client, message.chat.id, "duplicate")
+            logger.info(f"Document ignored - {duplicate_check} for user {user_id}")
+            return
     
     doc = message.document
     if not doc:
         return
     
-    # NOUVEAU: Détection vidéo pour traitement rapide
+    # Vérifier si c'est une vidéo (par MIME type)
     if doc.mime_type and doc.mime_type.startswith("video/"):
-        # Traitement vidéo rapide (sans téléchargement)
-        await handle_video_fast_caption(client, message)
+        # Traiter comme une vidéo
+        await handle_video_document(client, message, doc)
         return
     
-    # Accepter PDF et autres fichiers
-    if not (doc.mime_type == "application/pdf" or is_supported_video(doc.file_name)):
-        await client.send_message(message.chat.id, "❌ Ce fichier n'est pas supporté !\n\nSeuls les fichiers PDF et vidéo sont acceptés.")
+    # Vérifier si c'est un PDF
+    if doc.mime_type != "application/pdf" and not doc.file_name.lower().endswith('.pdf'):
+        await client.send_message(message.chat.id, "❌ This file is not supported!\n\nOnly PDF and video files are accepted.")
         return
     
+    # Le reste du code existant pour les PDF...
     if doc.file_size > MAX_FILE_SIZE:
         await client.send_message(message.chat.id, MESSAGES['file_too_big'])
         return
@@ -704,7 +779,7 @@ async def handle_document(client, message: Message):
     file_name = doc.file_name or "document.pdf"
     
     # Vérifier si on est en mode batch
-    if sessions.get(user_id, {}).get('batch_mode'):
+    if session.get('batch_mode'):
         # Vérifier l'existence de user_batches[user_id]
         if user_id not in user_batches:
             user_batches[user_id] = []
@@ -713,37 +788,43 @@ async def handle_document(client, message: Message):
             await client.send_message(message.chat.id, f"❌ Limit of {MAX_BATCH_FILES} files reached!")
             return
         
+        # 📄 AJOUTER UNIQUEMENT LES INFOS, PAS DE TÉLÉCHARGEMENT
         user_batches[user_id].append({
             'file_id': file_id,
-            'file_name': file_name
+            'file_name': file_name,
+            'is_video': False,
+            'message_id': message.id,
+            'size': doc.file_size
         })
         
         await client.send_message(
             message.chat.id,
-            f"✅ File added to batch ({len(user_batches[user_id])}/{MAX_BATCH_FILES})\n\n"
+            f"✅ **File added to batch** ({len(user_batches[user_id])}/{MAX_BATCH_FILES})\n\n"
+            f"📄 {file_name}\n"
+            f"📦 Size: {doc.file_size} bytes\n\n"
             f"Send `/process` when you're done adding files"
         )
+        
+        # 🔥 LOG pour debug
+        logger.info(f"📦 BATCH: File added for user {user_id} - Total: {len(user_batches[user_id])}")
         return
     
     # Mode normal - créer une nouvelle session
-    if user_id not in sessions:
-        sessions[user_id] = {}
-    
     # NOUVEAU: Charger le username depuis le fichier persistant
     saved_username = get_saved_username(user_id)
-    delete_delay = sessions[user_id].get('delete_delay', AUTO_DELETE_DELAY)
+    delete_delay = session.get('delete_delay', AUTO_DELETE_DELAY)
     
-    sessions[user_id] = {
+    session.update({
         'file_id': file_id,
         'file_name': file_name,
         'last_activity': datetime.now()
-    }
+    })
     
     # NOUVEAU: Restaurer le username depuis le fichier
     if saved_username:
-        sessions[user_id]['username'] = saved_username
+        session['username'] = saved_username
     if delete_delay != AUTO_DELETE_DELAY:
-        sessions[user_id]['delete_delay'] = delete_delay
+        session['delete_delay'] = delete_delay
     
     # Créer le menu selon le type de fichier
     if is_pdf_file(file_name):
@@ -757,18 +838,147 @@ async def handle_document(client, message: Message):
         ])
         message_text = f"📄 PDF received: {file_name}\n\nWhat do you want to do?"
     else:
-        # Menu limité pour les vidéos
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🧹 Clean usernames", callback_data=f"clean_username:{user_id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")]
-        ])
-        message_text = f"🎥 Video received: {file_name}\n\nOnly username cleaning is available for videos."
+        # Pas de menu pour les vidéos - elles sont gérées par handle_video_document
+        return
     
     await client.send_message(
         message.chat.id,
         message_text,
         reply_markup=keyboard
     )
+
+# ====== NOUVEAU HANDLER POUR LES VIDÉOS ======
+@app.on_message(filters.video & filters.private)
+async def handle_video(client, message: Message):
+    user_id = message.from_user.id
+    
+    # S'assurer que la session existe et mettre à jour l'activité
+    session = ensure_session_dict(user_id)
+    session['last_activity'] = datetime.now()
+    
+    # 🔥 VÉRIFICATION FORCE JOIN 🔥
+    if not await is_user_in_channel(user_id):
+        await send_force_join_message(client, message)
+        return
+    
+    # Protection anti-doublon et rate limit
+    duplicate_check = is_duplicate_message(user_id, message.id, "video")
+    if duplicate_check:
+        if duplicate_check == "rate_limit":
+            await send_limit_message(client, message.chat.id, "rate_limit")
+        elif duplicate_check == "duplicate":
+            await send_limit_message(client, message.chat.id, "duplicate")
+        logger.info(f"Video ignored - {duplicate_check} for user {user_id}")
+        return
+    
+    # Initialiser la session si nécessaire
+    if user_id not in sessions:
+        sessions[user_id] = {}
+    
+    # Sauvegarder les infos de la vidéo
+    session['video_file_id'] = message.video.file_id
+    session['video_file_name'] = message.video.file_name or "video.mp4"
+    session['video_message_id'] = message.id
+    session['last_activity'] = datetime.now()
+    
+    logger.info(f"🎥 Video received from user {user_id}: {session['video_file_name']}")
+    
+    # Créer le menu selon le mode
+    if session.get('batch_mode'):
+        # Mode batch - PAS DE TÉLÉCHARGEMENT, juste stocker les infos
+        if user_id not in user_batches:
+            user_batches[user_id] = []
+            
+        if len(user_batches[user_id]) >= MAX_BATCH_FILES:
+            await client.send_message(message.chat.id, f"❌ Limit of {MAX_BATCH_FILES} files reached!")
+            return
+        
+        # Ajouter au batch SANS téléchargement
+        user_batches[user_id].append({
+            'file_id': message.video.file_id,
+            'file_name': message.video.file_name or "video.mp4",
+            'is_video': True,
+            'message_id': message.id,
+            'caption': message.caption or "",  # Caption originale
+            'duration': message.video.duration,
+            'size': message.video.file_size
+        })
+        
+        # Ajout vidéo en batch (sans boutons)
+        await client.send_message(
+            message.chat.id,
+            f"✅ Video added to batch ({len(user_batches[user_id])}/{MAX_BATCH_FILES})\n\n"
+            f"What do you want to do with this video?"
+        )
+    else:
+        # Mode normal - seulement Edit Name + Cancel
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Edit Name", callback_data=f"video_edit_name:{user_id}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")]
+        ])
+    
+    await client.send_message(
+        message.chat.id,
+            f"🎥 **Video received**: {session['video_file_name']}\n\nWhat do you want to do?",
+        reply_markup=keyboard
+    )
+
+
+async def handle_video_document(client, message: Message, doc):
+    """Traite les vidéos envoyées comme documents"""
+    user_id = message.from_user.id
+    
+    # S'assurer que la session existe et mettre à jour l'activité
+    session = ensure_session_dict(user_id)
+    session['last_activity'] = datetime.now()
+    
+    # Sauvegarder les infos de la vidéo
+    session['video_file_id'] = doc.file_id
+    session['video_file_name'] = doc.file_name or "video.mp4"
+    session['video_message_id'] = message.id
+    session['last_activity'] = datetime.now()
+    
+    logger.info(f"🎥 Video document received from user {user_id}: {session['video_file_name']}")
+    
+    # Créer le menu selon le mode
+    if session.get('batch_mode'):
+        # Mode batch - PAS DE TÉLÉCHARGEMENT, juste stocker les infos
+        if user_id not in user_batches:
+            user_batches[user_id] = []
+            
+        if len(user_batches[user_id]) >= MAX_BATCH_FILES:
+            await client.send_message(message.chat.id, f"❌ Limit of {MAX_BATCH_FILES} files reached!")
+            return
+        
+        # Ajouter au batch SANS téléchargement
+        user_batches[user_id].append({
+            'file_id': doc.file_id,
+            'file_name': doc.file_name or "video.mp4",
+            'is_video': True,
+            'message_id': message.id,
+            'caption': message.caption or "",  # Caption originale
+            'size': doc.file_size
+        })
+        
+        # Ajout vidéo en batch (sans boutons)
+        await client.send_message(
+            message.chat.id,
+            f"✅ Video added to batch ({len(user_batches[user_id])}/{MAX_BATCH_FILES})\n\n"
+            f"What do you want to do with this video?"
+        )
+    else:
+        # Mode normal - seulement Edit Name + Cancel
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Edit Name", callback_data=f"video_edit_name:{user_id}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")]
+        ])
+        
+        await client.send_message(
+            message.chat.id,
+            f"🎥 **Video received**: {session['video_file_name']}\n\nWhat do you want to do?",
+            reply_markup=keyboard
+        )
+
 
 # 🔥 HANDLER POUR LE BOUTON "I have joined" 🔥
 @app.on_callback_query(filters.regex("^check_joined$"))
@@ -793,77 +1003,228 @@ async def check_joined_handler(client, query: CallbackQuery):
         await query.answer("❌ You haven't joined the channel yet!", show_alert=True)
         logger.info(f"❌ User {user_id} verification failed - not member of channel")
 
-# 🎥 NOUVELLE FONCTION POUR TRAITEMENT RAPIDE DES VIDÉOS 🎥
-async def handle_video_fast_caption(client, message: Message):
-    """Traite les vidéos en mode rapide - caption only, sans téléchargement"""
-    user_id = message.from_user.id
-    doc = message.document
+# 🔥 HANDLERS POUR LES BOUTONS DE SUPPRESSION DE PAGES 🔥
+@app.on_callback_query(filters.regex(r"^the_first:(\d+)$"))
+async def remove_first_page(client, query: CallbackQuery):
+    user_id = int(query.matches[0].group(1))
+    await remove_page_logic(client, query, user_id, page_number=1)
+
+@app.on_callback_query(filters.regex(r"^the_last:(\d+)$"))
+async def remove_last_page(client, query: CallbackQuery):
+    user_id = int(query.matches[0].group(1))
+    session = ensure_session_dict(user_id)
+    file_id = session.get('file_id')
+    if not file_id:
+        await query.edit_message_text("❌ Aucun fichier PDF trouvé.")
+        return
     
-    # Récupérer le nom original du fichier
-    original_name = doc.file_name or "video.mp4"
+    # Calculate the last page automatically
+    file_path = await client.download_media(file_id, file_name=f"{get_user_temp_dir(user_id)}/temp.pdf")
+    with open(file_path, 'rb') as f:
+        reader = PdfReader(f)
+        if reader.is_encrypted:
+            await query.edit_message_text("❌ Cannot delete page (PDF protected)")
+            return
+        last_page = len(reader.pages)
+    await remove_page_logic(client, query, user_id, page_number=last_page)
+
+@app.on_callback_query(filters.regex(r"^the_middle:(\d+)$"))
+async def remove_middle_page(client, query: CallbackQuery):
+    user_id = int(query.matches[0].group(1))
+    session = ensure_session_dict(user_id)
+    file_id = session.get('file_id')
+    if not file_id:
+        await query.edit_message_text("❌ No PDF file found.")
+        return
     
-    logger.info(f"🎥 Fast video processing for user {user_id} - File: {original_name}")
+    # Calculate the middle page
+    file_path = await client.download_media(file_id, file_name=f"{get_user_temp_dir(user_id)}/temp.pdf")
+    with open(file_path, 'rb') as f:
+        reader = PdfReader(f)
+        if reader.is_encrypted:
+            await query.edit_message_text("❌ Cannot delete page (PDF protected)")
+            return
+        total_pages = len(reader.pages)
+        middle_page = total_pages // 2 if total_pages % 2 == 0 else (total_pages // 2) + 1
+    await remove_page_logic(client, query, user_id, page_number=middle_page)
+
+@app.on_callback_query(filters.regex(r"^enter_manually:(\d+)$"))
+async def ask_user_page_input(client, query: CallbackQuery):
+    user_id = int(query.matches[0].group(1))
+    session = ensure_session_dict(user_id)
+    session['awaiting_page_number'] = True
+    await query.edit_message_text("📝 Enter the page number to delete:")
+
+
+# ====== CALLBACKS POUR LES VIDÉOS ======
+@app.on_callback_query(filters.regex(r"^video_clean_name:(\d+)$"))
+async def video_clean_name_callback(client, query: CallbackQuery):
+    user_id = int(query.matches[0].group(1))
     
-    # Nettoyer le nom (supprimer tous les @usernames et hashtags)
-    cleaned_name = clean_text(original_name)
+    if query.from_user.id != user_id:
+        await query.answer("❌ This is not for you!", show_alert=True)
+        return
     
-    # Récupérer le username enregistré dans le bot
-    saved_username = get_saved_username(user_id)
+    await query.answer("✅ Cleaning video name...", show_alert=False)
     
-    # Si username existe, l'ajouter au nom nettoyé
-    if saved_username:
-        # Séparer nom et extension
-        name, ext = os.path.splitext(cleaned_name)
-        new_caption = f"{name} {saved_username}{ext}"
-    else:
-        new_caption = cleaned_name
+    # Récupérer la vidéo dans le batch
+    video_entry = None
+    for entry in user_batches.get(user_id, []):
+        if entry.get('is_video'):
+            video_entry = entry
+            break
     
-    # Mode batch ou normal ?
-    if sessions.get(user_id, {}).get('batch_mode'):
-        # Mode batch - ajouter à la liste pour traitement groupé
-        if user_id not in user_batches:
-            user_batches[user_id] = []
-        
-        user_batches[user_id].append({
-            'file_id': doc.file_id,
-            'file_name': original_name,
-            'cleaned_caption': new_caption,
-            'is_video': True
-        })
-        
-        await client.send_message(
-            message.chat.id,
-            f"✅ Video added to batch ({len(user_batches[user_id])}/{MAX_BATCH_FILES})\n"
-            f"Caption will be: `{new_caption}`\n\n"
-            f"Send `/process` when ready",
-            parse_mode="markdown"
+    if not video_entry:
+        await query.edit_message_text("❌ Video not found in batch.")
+        return
+    
+    file_id = video_entry['file_id']
+    original_caption = video_entry.get('caption', '')
+    
+    # Nettoyer la caption et ajouter le username
+    final_caption = clean_caption_with_username(original_caption, user_id)
+    
+    try:
+        # Renvoyer la vidéo avec la caption nettoyée (SANS téléchargement)
+        await client.send_video(
+            chat_id=query.message.chat.id,
+            video=file_id,  # Utilise le file_id original
+            caption=final_caption
         )
-    else:
-        # Mode normal - traiter immédiatement
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Apply Caption", callback_data=f"apply_caption:{user_id}")],
-            [InlineKeyboardButton("✏️ Edit Caption", callback_data=f"edit_caption:{user_id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")]
-        ])
         
-        # Sauvegarder dans la session
-        sessions[user_id] = sessions.get(user_id, {})
-        sessions[user_id].update({
-            'original_message': message,
-            'cleaned_caption': new_caption,
-            'original_name': original_name,
-            'is_video': True
-        })
+        # Supprimer le message du menu
+        try:
+            await query.message.delete()
+        except:
+            pass
         
+        # Envoyer le message de succès
         await client.send_message(
-            message.chat.id,
-            f"🎥 **Video Caption Cleaner**\n\n"
-            f"Original: `{original_name}`\n"
-            f"Cleaned: `{new_caption}`\n\n"
-            f"Choose an action:",
-            reply_markup=keyboard,
-            parse_mode="markdown"
+            query.message.chat.id,
+            "✅ Video cleaned and sent successfully!"
         )
+        
+        logger.info(f"✅ Video sent with cleaned caption: {final_caption}")
+        
+    except Exception as e:
+        logger.error(f"Error in video_clean_name: {e}")
+        await query.edit_message_text(f"❌ Error: {str(e)}")
+
+
+@app.on_callback_query(filters.regex(r"^video_edit_name:(\d+)$"))
+async def video_edit_name_callback(client, query: CallbackQuery):
+    user_id = int(query.matches[0].group(1))
+    
+    if query.from_user.id != user_id:
+        await query.answer("❌ This is not for you!", show_alert=True)
+        return
+    
+    await query.answer()
+    
+    session = ensure_session_dict(user_id)
+    video_file_id = session.get('video_file_id')
+    
+    if not video_file_id:
+        await query.edit_message_text("❌ No video in session. Send a video first.")
+        return
+    
+    # Activer le mode d'attente du nouveau nom
+    session['awaiting_video_name'] = True
+    session['video_edit_message_id'] = query.message.id
+    
+    await query.edit_message_text(
+        "✏️ **Send me the new filename for the video**\n\n"
+        "Example: `My Amazing Video.mp4`"
+    )
+
+
+# ====== CALLBACK GÉNÉRIQUE POUR NETTOYER LES NOMS ======
+@app.on_callback_query(filters.regex(r"^clean_name:(.+)$"))
+async def clean_name_callback(client, query: CallbackQuery):
+    try:
+        file_id = query.data.split(":")[1]
+        msg = await client.get_messages(chat_id=query.message.chat.id, message_ids=int(file_id))
+
+        if not msg.video and not msg.document:
+            return await query.answer("❌ This button only works for video and document files.", show_alert=True)
+
+        await query.answer("✅ Cleaning name...", show_alert=False)
+
+        if msg.video:
+            # Traitement vidéo - utiliser la fonction unifiée
+            original_caption = msg.caption or ""
+            success = await clean_and_send_video(
+                client=client,
+                chat_id=query.message.chat.id,
+                file_id=msg.video.file_id,
+                caption=original_caption,
+                user_id=query.from_user.id
+            )
+            
+            if not success:
+                await query.answer("❌ Error processing video", show_alert=True)
+                return
+        elif msg.document:
+            # Traitement document (PDF) - utiliser la caption originale
+            original_caption = msg.caption or ""
+            final_caption = clean_caption_with_username(original_caption, query.from_user.id)
+
+            await client.send_document(
+                chat_id=query.message.chat.id,
+                document=msg.document.file_id,
+                caption=final_caption
+            )
+
+        await query.message.reply_text("✅ File name cleaned successfully!")
+
+    except Exception as e:
+        logger.exception("❌ Error in clean_name_callback:")
+        await query.answer("⚠️ An error occurred while cleaning the name.", show_alert=True)
+
+# 🔥 FONCTION DE LOGIQUE DE SUPPRESSION AVEC VÉRIFICATION DE VERROUILLAGE 🔥
+async def remove_page_logic(client, query, user_id, page_number):
+    """Common logic for deleting a page"""
+    session = ensure_session_dict(user_id)
+    file_id = session.get('file_id')
+    if not file_id:
+        await query.edit_message_text("❌ No PDF file found.")
+        return
+    
+    file_path = await client.download_media(file_id, file_name=f"{get_user_temp_dir(user_id)}/input.pdf")
+    
+    # Check if PDF is locked
+    with open(file_path, 'rb') as f:
+        reader = PdfReader(f)
+        if reader.is_encrypted:
+            await query.edit_message_text("❌ Cannot delete page (PDF protected)")
+            return
+        
+        total_pages = len(reader.pages)
+        if page_number < 1 or page_number > total_pages:
+            await query.edit_message_text(f"❌ Invalid page number. The PDF has {total_pages} pages.")
+            return
+        
+        # Delete the page
+        writer = PdfWriter()
+        for i in range(total_pages):
+            if (i + 1) != page_number:  # Keep all pages except the one to delete
+                writer.add_page(reader.pages[i])
+        
+        # Save the modified PDF
+        output_path = f"{get_user_temp_dir(user_id)}/modified_{session.get('file_name', 'document.pdf')}"
+        with open(output_path, 'wb') as out:
+            writer.write(out)
+        
+        # Send the modified file directly (no confirmation message)
+        username = session.get('username', '')
+        new_file_name = replace_username_in_filename(session.get('file_name', 'document.pdf'), username)
+        delay = session.get('delete_delay', AUTO_DELETE_DELAY)
+        
+        await send_and_delete(client, query.message.chat.id, output_path, new_file_name, delay_seconds=delay)
+        await query.edit_message_text(f"✅ Page {page_number} deleted successfully!")
+        
+        # ✅ FIX: Reset processing flag after successful page removal
+        sessions[user_id]['processing'] = False
 
 @app.on_callback_query() 
 async def button_callback(client, query: CallbackQuery):
@@ -878,8 +1239,8 @@ async def button_callback(client, query: CallbackQuery):
     data = query.data
     user_id = query.from_user.id
     
-    if user_id not in sessions:
-        sessions[user_id] = {}
+    # S'assurer que la session existe
+    session = ensure_session_dict(user_id)
     
     # Reset tous les flags temporaires au début
     reset_session_flags(user_id)
@@ -887,71 +1248,6 @@ async def button_callback(client, query: CallbackQuery):
     # Check if action is already in progress (except for clean_username, settings, and delay)
     if sessions[user_id].get('processing') and not data.startswith("clean_username") and not data.startswith("delay_") and data not in ["settings", "set_delete_delay", "back_to_start"]:
         await query.answer("⏳ Processing already in progress...", show_alert=True)
-        return
-    
-    # 🎥 NOUVEAUX CALLBACKS POUR VIDÉOS 🎥
-    # Callback pour appliquer la caption (mode normal)
-    if data.startswith("apply_caption:"):
-        target_user_id = int(data.split(":")[1])
-        if query.from_user.id != target_user_id:
-            await query.answer("❌ Not authorized", show_alert=True)
-            return
-        
-        session = sessions.get(target_user_id, {})
-        if not session.get('is_video'):
-            await query.answer("❌ Session expired", show_alert=True)
-            return
-        
-        original_msg = session.get('original_message')
-        cleaned_caption = session.get('cleaned_caption')
-        
-        if not original_msg or not cleaned_caption:
-            await query.answer("❌ Missing data", show_alert=True)
-            return
-        
-        try:
-            # Répondre avec la vidéo et la nouvelle caption
-            await client.send_video(
-                chat_id=query.message.chat.id,
-                video=original_msg.document.file_id,
-                caption=f"`{cleaned_caption}`",
-                parse_mode="markdown"
-            )
-            
-            await query.edit_message_text(
-                f"✅ **Video sent with cleaned caption!**\n\n"
-                f"Caption: `{cleaned_caption}`",
-                parse_mode="markdown"
-            )
-            
-        except Exception as e:
-            logger.error(f"Error applying caption: {e}")
-            await query.answer(f"❌ Error: {str(e)}", show_alert=True)
-        
-        finally:
-            # Nettoyer la session
-            sessions.pop(target_user_id, None)
-        return
-    
-    # Callback pour éditer la caption (mode normal)
-    elif data.startswith("edit_caption:"):
-        target_user_id = int(data.split(":")[1])
-        if query.from_user.id != target_user_id:
-            await query.answer("❌ Not authorized", show_alert=True)
-            return
-        
-        session = sessions.get(target_user_id, {})
-        if not session.get('is_video'):
-            await query.answer("❌ Session expired", show_alert=True)
-            return
-        
-        session['awaiting_caption_edit'] = True
-        
-        await query.edit_message_text(
-            "✏️ **Send me the new caption for the video:**\n\n"
-            "Current: `{}`".format(session.get('cleaned_caption', '')),
-            parse_mode="markdown"
-        )
         return
     
     # Don't mark processing=True for clean_username, settings, and delay
@@ -964,8 +1260,11 @@ async def button_callback(client, query: CallbackQuery):
         
         await query.edit_message_text(
             f"📦 **Batch Mode Activated**\n\n"
-            f"You can now send up to {MAX_BATCH_FILES} PDF files.\n"
-            f"When you're done, send `/process` to process them.\n\n"
+            f"✅ You can now send up to {MAX_BATCH_FILES} files\n"
+            f"🎥 Videos will be downloaded immediately to avoid session expiration\n"
+            f"📄 PDFs will be processed when you send `/process`\n\n"
+            f"⏰ **Important**: Videos must be processed within 1-2 minutes of sending\n"
+            f"🔄 Send `/process` when you're done adding files\n\n"
             f"To disable batch mode, send `/start`"
         )
         sessions[user_id]['processing'] = False
@@ -1379,41 +1678,6 @@ async def handle_all_text(client, message: Message):
     if user_id in sessions:
         sessions[user_id]['last_activity'] = datetime.now()
 
-    # 🎥 NOUVEAU: Gestion de l'édition de caption des vidéos
-    if session.get('awaiting_caption_edit') and session.get('is_video'):
-        new_caption = message.text.strip()
-        original_msg = session.get('original_message')
-        
-        if not original_msg:
-            await message.reply("❌ Session expired")
-            sessions.pop(user_id, None)
-            return
-        
-        try:
-            # Envoyer la vidéo avec la nouvelle caption
-            await client.send_video(
-                chat_id=message.chat.id,
-                video=original_msg.document.file_id,
-                caption=f"`{new_caption}`",
-                parse_mode="markdown"
-            )
-            
-            await message.reply(
-                f"✅ **Video sent with custom caption!**\n\n"
-                f"Caption: `{new_caption}`",
-                parse_mode="markdown"
-            )
-            
-        except Exception as e:
-            logger.error(f"Error sending video with custom caption: {e}")
-            await message.reply(f"❌ Error: {str(e)}")
-        
-        finally:
-            # Nettoyer la session
-            sessions.pop(user_id, None)
-        
-        return
-
     # ✅ FIX: Mot de passe pour UNLOCK
     if session.get('action') == "unlock":
         password = message.text.strip()
@@ -1421,6 +1685,83 @@ async def handle_all_text(client, message: Message):
         await process_unlock(client, message, session, password)
         # Remet à zéro le flag
         session.pop('action', None)
+        return
+
+    # Gestion du renommage de vidéo
+    if session.get('awaiting_video_name'):
+        new_name = message.text.strip()
+        
+        # Assurer que le nom a une extension vidéo
+        if not any(new_name.lower().endswith(ext) for ext in ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm']):
+            # Ajouter .mp4 par défaut si pas d'extension
+            base_name = session.get('video_file_name', 'video.mp4')
+            ext = os.path.splitext(base_name)[1] or '.mp4'
+            new_name = f"{new_name}{ext}"
+        
+        video_file_id = session.get('video_file_id')
+        
+        if not video_file_id:
+            await client.send_message(message.chat.id, "❌ Video session expired.")
+            sessions[user_id].pop('awaiting_video_name', None)
+            return
+        
+        try:
+            # Supprimer le message de l'utilisateur
+            try:
+                await message.delete()
+            except:
+                pass
+            
+            # Supprimer le message d'instruction
+            if 'video_edit_message_id' in session:
+                try:
+                    await client.delete_messages(message.chat.id, session['video_edit_message_id'])
+                except:
+                    pass
+            
+            # Envoyer le message de succès
+            await client.send_message(
+                message.chat.id,
+                f"✅ Video renamed successfully to: {new_name}"
+            )
+            
+            # Marquer qu'on traite un fichier
+            await set_just_processed_flag(user_id)
+            
+            # Envoyer la vidéo avec le nouveau nom comme caption + username
+            delay = session.get('delete_delay', AUTO_DELETE_DELAY)
+            final_caption = clean_caption_with_username(new_name, user_id)
+            sent = await client.send_video(
+                chat_id=message.chat.id,
+                video=video_file_id,
+                caption=final_caption
+            )
+            
+            logger.info(f"✅ Video sent with new name: {final_caption}")
+            
+            # Planifier la suppression si nécessaire
+            if delay > 0:
+                async def delete_after_delay():
+                    await asyncio.sleep(delay)
+                    try:
+                        await sent.delete()
+                        logger.info(f"Video message deleted after {delay}s")
+                    except Exception as e:
+                        logger.error(f"Error deleting video message: {e}")
+                
+                asyncio.create_task(delete_after_delay())
+            
+            # Le flag est géré par set_just_processed_flag
+        except Exception as e:
+            logger.error(f"Error renaming video: {e}")
+            await client.send_message(message.chat.id, f"❌ Error: {str(e)}")
+        finally:
+            # Nettoyer la session
+            for key in ['awaiting_video_name', 'video_file_id', 'video_file_name', 'video_message_id', 'video_edit_message_id']:
+                sessions[user_id].pop(key, None)
+            # IMPORTANT: Supprimer complètement la session
+            sessions.pop(user_id, None)
+        
         return
 
     # --- NEW: Manual page entry for 'both' action ---
@@ -1648,6 +1989,13 @@ async def handle_all_text(client, message: Message):
             logger.error(f"Error process_both_final: {e}")
             await status.edit_text(MESSAGES['error'])
         finally:
+            # Nettoyer tout à la fin
+            user_batches[user_id].clear()
+            session = ensure_session_dict(user_id)
+            session.pop('batch_mode', None)
+            session.pop('batch_action', None)
+            session.pop('awaiting_batch_password', None)
+            session['processing'] = False
             # IMPORTANT: Supprimer complètement la session
             sessions.pop(user_id, None)
         return
@@ -1677,32 +2025,29 @@ async def handle_all_text(client, message: Message):
 
 # Fonctions de traitement batch
 async def process_batch_unlock(client, message, user_id, password):
-    
-    # Vérifier l'existence de user_batches[user_id]
     if user_id not in user_batches:
         user_batches[user_id] = []
     
     files = user_batches[user_id]
+    pdf_files = [f for f in files if is_pdf_file(f['file_name'])]
     
-    if not files:
-        # Utiliser edit_message_text au lieu de send_message
+    if not pdf_files:
         if hasattr(message, 'edit_message_text'):
-            await message.edit_message_text("❌ No files in batch")
+            await message.edit_message_text("❌ No PDF files in batch")
         else:
-            await client.send_message(message.chat.id, "❌ No files in batch")
+            await client.send_message(message.chat.id, "❌ No PDF files in batch")
         sessions[user_id]['processing'] = False
         return
     
-    # Utiliser la fonction helper pour créer le message de statut
     logger.info(f"🔍 Début process_batch_unlock - User {user_id} - Time: {datetime.now()}")
-    status = await create_or_edit_status(client, message, f"⏳ Processing {len(files)} files...")
+    status = await create_or_edit_status(client, message, f"⏳ Processing {len(pdf_files)} PDF files...")
     success_count = 0
     error_count = 0
     
     try:
-        for i, file_info in enumerate(files):
+        for i, file_info in enumerate(pdf_files):
             try:
-                await status.edit_text(f"⏳ Processing file {i+1}/{len(files)}...")
+                await status.edit_text(f"⏳ Processing file {i+1}/{len(pdf_files)}...")
                 
                 file = await client.download_media(file_info['file_id'], file_name=f"{get_user_temp_dir(user_id)}/batch_{i}.pdf")
                 
@@ -1713,8 +2058,7 @@ async def process_batch_unlock(client, message, user_id, password):
                     
                     with open(input_path, 'rb') as f:
                         reader = PdfReader(f)
-                        
-                        # Détection améliorée du mot de passe
+                        # Déverrouillage
                         if reader.is_encrypted:
                             try:
                                 if reader.decrypt("") or reader.decrypt(None):
@@ -1740,7 +2084,6 @@ async def process_batch_unlock(client, message, user_id, password):
                     
                     new_file_name = replace_username_in_filename(file_info['file_name'], username)
                     delay = session.get('delete_delay', AUTO_DELETE_DELAY)
-                    
                     await send_and_delete(client, message.chat.id, output_path, new_file_name, delay_seconds=delay)
                     
                     success_count += 1
@@ -1756,7 +2099,6 @@ async def process_batch_unlock(client, message, user_id, password):
         )
         
     finally:
-        # Nettoyer tout à la fin
         user_batches[user_id].clear()
         session = ensure_session_dict(user_id)
         session.pop('batch_mode', None)
@@ -1765,18 +2107,17 @@ async def process_batch_unlock(client, message, user_id, password):
         session['processing'] = False
 
 async def process_batch_pages(client, message, user_id, pages_text):
-    
-    # Vérifier l'existence de user_batches[user_id]
     if user_id not in user_batches:
         user_batches[user_id] = []
     
     files = user_batches[user_id]
+    pdf_files = [f for f in files if is_pdf_file(f['file_name'])]
     
-    if not files:
+    if not pdf_files:
         if hasattr(message, 'edit_message_text'):
-            await message.edit_message_text("❌ No files in batch")
+            await message.edit_message_text("❌ No PDF files in batch")
         else:
-            await client.send_message(message.chat.id, "❌ No files in batch")
+            await client.send_message(message.chat.id, "❌ No PDF files in batch")
         sessions[user_id]['processing'] = False
         return
     
@@ -1797,16 +2138,15 @@ async def process_batch_pages(client, message, user_id, pages_text):
         sessions[user_id]['processing'] = False
         return
     
-    # Utiliser la fonction helper
     logger.info(f"🔍 Début process_batch_pages - User {user_id} - Time: {datetime.now()}")
-    status = await create_or_edit_status(client, message, f"⏳ Processing {len(files)} files...")
+    status = await create_or_edit_status(client, message, f"⏳ Processing {len(pdf_files)} PDF files...")
     success_count = 0
     error_count = 0
     
     try:
-        for i, file_info in enumerate(files):
+        for i, file_info in enumerate(pdf_files):
             try:
-                await status.edit_text(f"⏳ Processing file {i+1}/{len(files)}...")
+                await status.edit_text(f"⏳ Processing file {i+1}/{len(pdf_files)}...")
                 
                 file = await client.download_media(file_info['file_id'], file_name=f"{get_user_temp_dir(user_id)}/batch_{i}.pdf")
                 
@@ -1838,7 +2178,6 @@ async def process_batch_pages(client, message, user_id, pages_text):
                     
                     new_file_name = replace_username_in_filename(file_info['file_name'], username)
                     delay = session.get('delete_delay', AUTO_DELETE_DELAY)
-                    
                     await send_and_delete(client, message.chat.id, output_path, new_file_name, delay_seconds=delay)
                     
                     success_count += 1
@@ -1854,7 +2193,6 @@ async def process_batch_pages(client, message, user_id, pages_text):
         )
         
     finally:
-        # Nettoyer tout à la fin
         user_batches[user_id].clear()
         session = ensure_session_dict(user_id)
         session.pop('batch_mode', None)
@@ -1862,18 +2200,17 @@ async def process_batch_pages(client, message, user_id, pages_text):
         session['processing'] = False
 
 async def process_batch_both(client, message, user_id, password, pages_text):
-    
-    # Vérifier l'existence de user_batches[user_id]
     if user_id not in user_batches:
         user_batches[user_id] = []
     
     files = user_batches[user_id]
+    pdf_files = [f for f in files if is_pdf_file(f['file_name'])]
     
-    if not files:
+    if not pdf_files:
         if hasattr(message, 'edit_message_text'):
-            await message.edit_message_text("❌ No files in batch")
+            await message.edit_message_text("❌ No PDF files in batch")
         else:
-            await client.send_message(message.chat.id, "❌ No files in batch")
+            await client.send_message(message.chat.id, "❌ No PDF files in batch")
         sessions[user_id]['processing'] = False
         return
     
@@ -1894,16 +2231,15 @@ async def process_batch_both(client, message, user_id, password, pages_text):
         sessions[user_id]['processing'] = False
         return
     
-    # Utiliser la fonction helper
     logger.info(f"🔍 Début process_batch_both - User {user_id} - Time: {datetime.now()}")
-    status = await create_or_edit_status(client, message, f"⏳ Combined processing of {len(files)} files...")
+    status = await create_or_edit_status(client, message, f"⏳ Combined processing of {len(pdf_files)} PDF files...")
     success_count = 0
     error_count = 0
     
     try:
-        for i, file_info in enumerate(files):
+        for i, file_info in enumerate(pdf_files):
             try:
-                await status.edit_text(f"⏳ Processing file {i+1}/{len(files)}...")
+                await status.edit_text(f"⏳ Processing file {i+1}/{len(pdf_files)}...")
                 
                 file = await client.download_media(file_info['file_id'], file_name=f"{get_user_temp_dir(user_id)}/batch_{i}.pdf")
                 
@@ -1914,7 +2250,6 @@ async def process_batch_both(client, message, user_id, password, pages_text):
                     
                     with open(input_path, 'rb') as f:
                         reader = PdfReader(f)
-                        
                         if reader.is_encrypted:
                             if password.lower() != 'none' and not reader.decrypt(password):
                                 error_count += 1
@@ -1940,7 +2275,6 @@ async def process_batch_both(client, message, user_id, password, pages_text):
                     
                     new_file_name = replace_username_in_filename(file_info['file_name'], username)
                     delay = session.get('delete_delay', AUTO_DELETE_DELAY)
-                    
                     await send_and_delete(client, message.chat.id, output_path, new_file_name, delay_seconds=delay)
                     
                     success_count += 1
@@ -1956,7 +2290,6 @@ async def process_batch_both(client, message, user_id, password, pages_text):
         )
         
     finally:
-        # Nettoyer tout à la fin
         user_batches[user_id].clear()
         session = ensure_session_dict(user_id)
         session.pop('batch_mode', None)
@@ -2141,92 +2474,251 @@ async def process_clean_username(client, message_or_query, session):
         sessions.pop(user_id, None)
 
 async def process_batch_clean(client, message, user_id):
-    """Fonction batch pour nettoyer uniquement les usernames du nom de fichier"""
     # Vérifier l'existence de user_batches[user_id]
     if user_id not in user_batches:
         user_batches[user_id] = []
     
     files = user_batches[user_id]
+    # Filtrer uniquement les PDF
+    pdf_files = [f for f in files if is_pdf_file(f['file_name'])]
     
-    if not files:
+    if not pdf_files:
         if hasattr(message, 'edit_message_text'):
-            await message.edit_message_text("❌ No files in batch")
+            await message.edit_message_text("❌ No PDF files in batch")
         else:
-            await client.send_message(message.chat.id, "❌ No files in batch")
+            await client.send_message(message.chat.id, "❌ No PDF files in batch")
         sessions[user_id]['processing'] = False
         return
     
-    # Utiliser la fonction helper
-    status = await create_or_edit_status(client, message, f"🧹 Cleaning usernames on {len(files)} files...")
+    status = await create_or_edit_status(client, message, f"🧹 Cleaning usernames on {len(pdf_files)} files...")
+    success_count = 0
+    error_count = 0
+    
+    try:
+        for i, file_info in enumerate(pdf_files):
+            try:
+                await status.edit_text(f"🧹 Cleaning file {i+1}/{len(pdf_files)}...")
+                
+                file_name = file_info['file_name']
+                
+                # Traitement PDF (seulement PDF ici)
+
+                
+                file = await client.download_media(file_info['file_id'], file_name=f"{get_user_temp_dir(user_id)}/batch_{i}.pdf")
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    input_path = Path(temp_dir) / "input.pdf"
+                    output_path = Path(temp_dir) / f"cleaned_{file_name}"
+                    shutil.move(file, input_path)
+                with open(input_path, 'rb') as f:
+                    reader = PdfReader(f)
+                    writer = PdfWriter()
+                    for page in reader.pages:
+                        writer.add_page(page)
+                    with open(output_path, 'wb') as out:
+                        writer.write(out)
+                username = sessions[user_id].get('username', '')
+                cleaned_name = replace_username_in_filename(file_name, username)
+                delay = sessions[user_id].get('delete_delay', AUTO_DELETE_DELAY)
+                await send_and_delete(client, message.chat.id, output_path, cleaned_name, delay_seconds=delay)
+
+                success_count += 1
+
+            except Exception as e:
+                logger.error(f"Error batch clean file {i}: {e}")
+                error_count += 1
+
+        await status.edit_message_text(
+            f"✅ Cleaning complete!\n\n"
+            f"Successful: {success_count}\n"
+            f"Errors: {error_count}"
+        )
+
+    finally:
+        user_batches[user_id].clear()
+        sessions[user_id].pop('batch_mode', None)
+        sessions[user_id]['processing'] = False
+
+async def process_video_batch_item(client, message, file_info, user_id):
+    """Traite une vidéo en mode batch clean - SANS TÉLÉCHARGEMENT"""
+    try:
+        file_id = file_info['file_id']
+        caption = file_info.get('caption', '')  # Caption originale
+        
+        # Utiliser la fonction unifiée pour nettoyer la caption
+        final_caption = clean_caption_with_username(caption, user_id)
+        
+        # Envoyer directement avec le file_id (pas de téléchargement!)
+        await client.send_video(
+            chat_id=message.chat.id,
+            video=file_id,  # Utilise le file_id original
+            caption=final_caption
+        )
+        
+        # Petit délai anti-flood
+        await asyncio.sleep(0.7)
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error processing video batch: {e}")
+        return False
+
+async def process_pdf_batch_item(client, message, file_info, user_id):
+    """Traite un PDF en mode batch clean"""
+    try:
+        file_name = file_info['file_name']
+        local_path = file_info.get('local_path')
+        
+        if local_path and os.path.exists(local_path):
+            with tempfile.TemporaryDirectory() as temp_dir:
+                input_path = Path(temp_dir) / "input.pdf"
+                output_path = Path(temp_dir) / f"cleaned_{file_name}"
+                shutil.copy2(local_path, input_path)
+                
+                with open(input_path, 'rb') as f:
+                    reader = PdfReader(f)
+                    writer = PdfWriter()
+                    
+                    # Copier toutes les pages sans modification
+                    for page in reader.pages:
+                        writer.add_page(page)
+                    
+                    with open(output_path, 'wb') as out:
+                        writer.write(out)
+                
+                # Nettoyer le nom du fichier
+                username = sessions[user_id].get('username', '')
+                cleaned_name = replace_username_in_filename(file_name, username)
+                
+                delay = sessions[user_id].get('delete_delay', AUTO_DELETE_DELAY)
+                await send_and_delete(client, message.chat.id, output_path, cleaned_name, delay_seconds=delay)
+        
+            return True
+        else:
+            logger.error(f"Local PDF file not found: {local_path}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error processing PDF batch: {e}")
+        return False
+
+async def clean_and_send_video(client, chat_id, file_id, caption, user_id, delay=AUTO_DELETE_DELAY):
+    """Fonction unifiée pour nettoyer et envoyer une vidéo"""
+    try:
+        # Nettoyer la caption et ajouter le username
+        final_caption = clean_caption_with_username(caption, user_id)
+                    
+        # Marquer qu'on traite un fichier
+        await set_just_processed_flag(user_id)
+        
+        # Envoyer la vidéo
+        sent = await client.send_video(
+            chat_id=chat_id,
+            video=file_id,
+            caption=final_caption
+        )
+        
+        # Planifier la suppression si nécessaire
+        if delay > 0:
+            async def delete_after_delay():
+                await asyncio.sleep(delay)
+                try:
+                    await sent.delete()
+                except Exception as e:
+                    logger.error(f"Error deleting video: {e}")
+            
+            asyncio.create_task(delete_after_delay())
+        
+        # Le flag est géré par set_just_processed_flag
+        pass
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error in clean_and_send_video: {e}")
+        return False
+
+async def process_batch_generic(client, message, user_id, action_func, action_name):
+    """Template générique pour le traitement batch"""
+    if user_id not in user_batches:
+        user_batches[user_id] = []
+    
+    files = user_batches[user_id]
+    if not files:
+        await safe_edit_message(message, "❌ No files in batch")
+        sessions[user_id]['processing'] = False
+        return
+    
+    status = await create_or_edit_status(client, message, f"⏳ Processing {len(files)} files...")
     success_count = 0
     error_count = 0
     
     try:
         for i, file_info in enumerate(files):
             try:
-                await status.edit_text(f"🧹 Cleaning file {i+1}/{len(files)}...")
-                
-                file_name = file_info['file_name']
-                
-                if is_pdf_file(file_name):
-                    # Traitement PDF
-                    file = await client.download_media(file_info['file_id'], file_name=f"{get_user_temp_dir(user_id)}/batch_{i}.pdf")
-                
-                    with tempfile.TemporaryDirectory() as temp_dir:
-                        input_path = Path(temp_dir) / "input.pdf"
-                        output_path = Path(temp_dir) / f"cleaned_{file_name}"
-                        shutil.move(file, input_path)
-                        
-                        with open(input_path, 'rb') as f:
-                            reader = PdfReader(f)
-                            writer = PdfWriter()
-                            
-                            # Copier toutes les pages sans modification
-                            for page in reader.pages:
-                                writer.add_page(page)
-                            
-                            with open(output_path, 'wb') as out:
-                                writer.write(out)
-                        
-                        # Nettoyer le nom du fichier
-                        username = sessions[user_id].get('username', '')
-                        cleaned_name = replace_username_in_filename(file_name, username)
-                        
-                        delay = sessions[user_id].get('delete_delay', AUTO_DELETE_DELAY)
-                        await send_and_delete(client, message.chat.id, output_path, cleaned_name, delay_seconds=delay)
-                    
-                else:
-                    # Traitement vidéo (simple renommage)
-                    file_path = await client.download_media(file_info['file_id'], file_name=f"{get_user_temp_dir(user_id)}/{file_name}")
-                    
-                    # Nettoyer le nom du fichier
-                    username = sessions[user_id].get('username', '')
-                    cleaned_name = replace_username_in_filename(file_name, username)
-                    
-                    # Créer le nouveau chemin avec le nom nettoyé
-                    new_path = os.path.join(get_user_temp_dir(user_id), cleaned_name)
-                    shutil.move(file_path, new_path)
-                    
-                    delay = sessions[user_id].get('delete_delay', AUTO_DELETE_DELAY)
-                    await send_and_delete(client, message.chat.id, new_path, cleaned_name, delay_seconds=delay)
-                
+                await status.edit_text(f"⏳ {action_name} {i+1}/{len(files)}...")
+                result = await action_func(client, file_info, user_id, i)
+                if result:
                     success_count += 1
-                    
+                else:
+                    error_count += 1
             except Exception as e:
-                logger.error(f"Error batch clean file {i}: {e}")
+                logger.error(f"Error in batch {action_name}: {e}")
                 error_count += 1
         
-        await status.edit_message_text(
-            f"✅ Cleaning complete!\n\n"
-            f"Successful: {success_count}\n"
-            f"Errors: {error_count}"
-        )
+        await show_batch_results(status, success_count, error_count)
         
     finally:
-        # Nettoyer tout à la fin
         user_batches[user_id].clear()
-        sessions[user_id].pop('batch_mode', None)
+        reset_session_flags(user_id)
         sessions[user_id]['processing'] = False
+
+async def show_batch_results(status, success_count, error_count):
+    """Affiche les résultats du traitement batch"""
+    if error_count == 0:
+        await status.edit_message_text(
+            f"✅ **Batch processing completed successfully!**\n\n"
+            f"📊 **Statistics:**\n"
+            f"• ✅ Success: {success_count} files\n"
+            f"• ❌ Errors: {error_count} files\n\n"
+            f"🎉 All files have been processed and cleaned!"
+        )
+    else:
+        await status.edit_message_text(
+            f"⚠️ **Batch processing completed with errors**\n\n"
+            f"📊 **Statistics:**\n"
+            f"• ✅ Success: {success_count} files\n"
+            f"• ❌ Errors: {error_count} files\n\n"
+            f"💡 Some files could not be processed. Please check the error messages above."
+        )
+
+async def handle_session_expired_error(client, chat_id, file_type="file"):
+    """Gère les erreurs de session expirée avec un message clair"""
+    await client.send_message(
+        chat_id,
+        f"❌ **{file_type.title()} session expired**\n\n"
+        f"The {file_type} session has expired and cannot be processed.\n"
+        f"Please resend the {file_type} - it must be processed within 1-2 minutes of sending.\n\n"
+        f"This happens when {file_type}s are not processed quickly enough after being sent."
+    )
+
+async def cleanup_batch_temp_files(user_id):
+    """Nettoie automatiquement tous les fichiers temporaires d'un utilisateur en mode batch"""
+    try:
+        # Nettoyer les fichiers temporaires générés pendant le traitement
+        temp_dir = get_user_temp_dir(user_id)
+        if os.path.exists(temp_dir):
+            for filename in os.listdir(temp_dir):
+                if filename.startswith('batch_') or filename.startswith('temp_'):
+                    file_path = os.path.join(temp_dir, filename)
+                    try:
+                        os.remove(file_path)
+                        logger.info(f"Cleaned up temporary file: {file_path}")
+                    except Exception as e:
+                        logger.error(f"Error deleting temporary file {file_path}: {e}")
+                        
+    except Exception as e:
+        logger.error(f"Error in cleanup_batch_temp_files for user {user_id}: {e}")
 
 # Fonction de nettoyage périodique des fichiers temporaires
 async def cleanup_temp_files():
@@ -2805,46 +3297,6 @@ async def process_both(client, message, session, text):
         # IMPORTANT: Supprimer complètement la session
         sessions.pop(user_id, None)
 
-async def process_batch_videos_caption(client, message, user_id):
-    """Traite les vidéos en batch avec caption seulement"""
-    if user_id not in user_batches:
-        await message.reply("❌ No files in batch")
-        return
-    
-    videos = [f for f in user_batches[user_id] if f.get('is_video')]
-    
-    if not videos:
-        await message.reply("❌ No videos in batch")
-        return
-    
-    status = await message.reply(f"⏳ Processing {len(videos)} videos...")
-    
-    try:
-        for i, video_info in enumerate(videos):
-            try:
-                await status.edit_text(f"⏳ Processing video {i+1}/{len(videos)}...")
-                
-                # Envoyer la vidéo avec la caption nettoyée
-                await client.send_video(
-                    chat_id=message.chat.id,
-                    video=video_info['file_id'],
-                    caption=f"`{video_info['cleaned_caption']}`",
-                    parse_mode="markdown"
-                )
-                
-                await asyncio.sleep(0.5)  # Petit délai entre chaque envoi
-                
-            except Exception as e:
-                logger.error(f"Error processing video {i}: {e}")
-        
-        await status.edit_text(f"✅ Batch complete! {len(videos)} videos processed.")
-        
-    finally:
-        # Nettoyer le batch
-        user_batches[user_id] = [f for f in user_batches[user_id] if not f.get('is_video')]
-        if not user_batches[user_id]:
-            user_batches.pop(user_id, None)
-
 # Lancement du bot
 if __name__ == "__main__":
     print("🚀 Starting PDF Bot (Pyrogram) - ENGLISH VERSION WITH FORCE JOIN - CORRECTED")
@@ -2866,6 +3318,8 @@ if __name__ == "__main__":
     print("  ✅ Improved error handling for corrupted PDFs")
     print("  ✅ Fixed delay=0 handling")
     print("  ✅ Better password detection")
+    print("  ✅ Full video support with rename and clean")
+    print("  ✅ Video batch processing")
     print("\n🔧 All bugs fixed and tested!")
     
     app.run()
