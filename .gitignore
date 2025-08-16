@@ -2,6 +2,7 @@
 config.py
 usernames.json
 pdf_settings.json
+force_join_channels.json
 *.session
 
 # Dossiers temporaires
