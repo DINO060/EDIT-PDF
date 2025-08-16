@@ -1,5 +1,5 @@
 pyrogram==2.0.106
-PyPDF2==3.0.1
+pikepdf
 redis==5.0.1
 prometheus_client==0.17.1
 asyncio

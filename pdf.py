@@ -1,8 +1,8 @@
 """
-Bot Telegram pour la gestion des PDF - VERSION CORRIGÉE
-Compatible avec Python 3.13 et python-telegram-bot 21.x
-Avec support batch (24 fichiers max) et suppression automatique
-Version anglaise avec Force Join Channel
+Telegram Bot for PDF management - CORRECTED VERSION
+Compatible with Python 3.13 and python-telegram-bot 21.x
+With batch support (24 files max) and automatic deletion
+English version with Force Join Channel
 """
 
 import os
@@ -13,6 +13,7 @@ import re
 import asyncio
 import shutil
 import json
+import sqlite3
 import time
 import mimetypes
 from pathlib import Path
@@ -42,19 +43,19 @@ BOT_TOKEN = get_env_or_config("BOT_TOKEN")
 ADMIN_IDS = get_env_or_config("ADMIN_IDS", "")
 
 
-# Fichier pour stocker les usernames de manière persistante
+# File to store usernames persistently
 USERNAMES_FILE = Path("usernames.json")
 
-# Username par défaut à ajouter à la fin des captions
-DEFAULT_USERNAME_TAG = "@PdfBot"  # Changez selon votre bot
+# Default username to add at the end of captions
+DEFAULT_USERNAME_TAG = "@PdfBot"  # Change according to your bot
 
 def is_supported_video(filename):
-    """Détecte si le fichier est une vidéo supportée"""
+    """Detects if the file is a supported video"""
     mimetype, _ = mimetypes.guess_type(filename)
     return mimetype and mimetype.startswith("video/")
 
 def clean_caption_with_username(original_caption: str, user_id: int = None) -> str:
-    """Nettoie la caption et ajoute le username sauvegardé de l'utilisateur à la fin"""
+    """Cleans the caption and adds the saved username of the user at the end"""
     # Supprimer tous les @usernames existants
     cleaned = re.sub(r"@[\w_]+", "", original_caption).strip()
     
@@ -73,11 +74,32 @@ def clean_caption_with_username(original_caption: str, user_id: int = None) -> s
     return cleaned
 
 def is_pdf_file(filename):
-    """Détecte si le fichier est un PDF"""
+    """Detects if the file is a PDF"""
     return filename.lower().endswith('.pdf')
 
+def clean_filename(filename):
+    """Cleans the filename by removing blocks with @ or # and emojis"""
+    # Supprime tous les blocs [ ] ( ) { } < > contenant @ ou #
+    cleaned = re.sub(r'[\[\(\{\<][^)\]\}\>]*[@#][^)\]\}\>]*[\]\)\}\>]', '', filename)
+    
+    # Supprime tous les emojis
+    emoji_pattern = re.compile(
+        "["
+        u"\U0001F600-\U0001F64F"  # emoticons
+        u"\U0001F300-\U0001F5FF"  # symbols & pictographs
+        u"\U0001F680-\U0001F6FF"  # transport & map symbols
+        u"\U0001F1E0-\U0001F1FF"  # flags (iOS)
+        u"\U00002700-\U000027BF"
+        u"\U000024C2-\U0001F251"
+        "]+", flags=re.UNICODE)
+    cleaned = emoji_pattern.sub(r'', cleaned)
+    
+    # Nettoie les espaces multiples
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
 def save_username(user_id, username):
-    """Sauvegarde le username d'un utilisateur de manière persistante"""
+    """Saves a user's username persistently"""
     try:
         # Charger les données existantes
         if USERNAMES_FILE.exists():
@@ -93,14 +115,14 @@ def save_username(user_id, username):
         with open(USERNAMES_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         
-        logger.info(f"💾 Username sauvegardé pour user {user_id}: {username}")
+        logger.info(f"💾 Username saved for user {user_id}: {username}")
         return True
     except Exception as e:
         logger.error(f"❌ Error saving username: {e}")
         return False
 
 def get_saved_username(user_id):
-    """Récupère le username sauvegardé d'un utilisateur"""
+    """Retrieves the saved username of a user"""
     try:
         if USERNAMES_FILE.exists():
             with open(USERNAMES_FILE, "r", encoding="utf-8") as f:
@@ -112,7 +134,7 @@ def get_saved_username(user_id):
         return None
 
 def delete_saved_username(user_id):
-    """Supprime le username sauvegardé d'un utilisateur"""
+    """Deletes the saved username of a user"""
     try:
         if USERNAMES_FILE.exists():
             with open(USERNAMES_FILE, "r", encoding="utf-8") as f:
@@ -132,7 +154,7 @@ def delete_saved_username(user_id):
         return False
 
 # 🔥 CONFIGURATION FORCE JOIN CHANNEL 🔥
-FORCE_JOIN_CHANNEL = "djd208"  # ⚠️ REMPLACE PAR TON CANAL (sans @)
+# Mode multi-canaux activé (voir helpers get_forced_channels/set_forced_channels)
 
 MAX_FILE_SIZE = 1_400 * 1024 * 1024  # 14 GB
 MAX_BATCH_FILES = 24
@@ -140,7 +162,33 @@ AUTO_DELETE_DELAY = 300  # 5 minutes
 
 # Messages du bot en anglais
 MESSAGES = {
-    'start': "🤖 *PDF Manager Bot ready!*\n\n📄 *Normal Mode*: Send a PDF to process it\n📦 *Batch Mode*: Process up to 24 files at once with `/batch`\n\nSend me a PDF to get started!",
+    'start': (
+        "👋 Welcome to Advanced PDF Tools Bot!\n\n"
+        "Send me a PDF and I'll help you clean, edit, add banner and lock it.\n\n"
+        "📋 Features:\n"
+        "• Clean usernames in filename\n"
+        "• Unlock protected PDFs\n"
+        "• Remove pages\n"
+        "• Add your default banner\n"
+        "• Lock with your default password\n"
+        "• Extract a page as image\n"
+        "• Sequence processing\n\n"
+        "🎯 Commands:\n"
+        "/start - Show this message\n"
+        "/batch - Enable sequence mode\n"
+        "/process - Process sequence files\n"
+        "/setbanner - Set your default banner\n"
+        "/view_banner - View your banner\n"
+        "/setpassword - Set default lock password\n"
+        "/reset_password - Change default lock password\n"
+        "/setextra_pages - Extract a page as image\n"
+        "/pdf_edit - Unlock → remove pages → add banner → lock\n"
+        "/addfsub - Add forced-subscription channels (admin)\n"
+        "/delfsub - Delete forced-subscription channels (admin)\n"
+        "/channels - List forced-subscription channels (admin)\n"
+        "/status - Check bot status and statistics\n\n"
+        "📤 Just send me a PDF to get started!"
+    ),
     'not_pdf': "❌ *This is not a PDF file!*",
     'file_too_big': "❌ *File is too large!*",
     'processing': "⏳ _Processing..._",
@@ -156,12 +204,167 @@ try:
 except NameError:
     pass  # CONFIG_MESSAGES n'existe pas, on garde les messages par défaut
 
+import pikepdf
+import asyncio
+from functools import wraps
+from typing import List
 try:
-    from PyPDF2 import PdfReader, PdfWriter, PageObject
+    import psutil  # facultatif pour RAM/CPU
+except Exception:
+    psutil = None
+
+START_TIME = time.time()
+
+USERS_FILE = Path("users.json")
+FJ_FILE = Path("force_join_channels.json")
+STATS_FILE = Path("stats.json")
+DB_FILE = Path("bot_data.sqlite3")
+
+def _load_json(path: Path, default):
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return default
+
+def _save_json(path: Path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Error saving {path.name}: {e}")
+
+# ==== Persistent storage (SQLite) for users and stats ====
+def init_db():
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS stats (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    files INTEGER NOT NULL DEFAULT 0,
+                    storage_bytes INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            conn.execute("INSERT OR IGNORE INTO stats(id, files, storage_bytes) VALUES (1, 0, 0)")
+    except Exception as e:
+        logger.error(f"Error initializing DB: {e}")
+
+def migrate_json_to_db():
+    """One-time migration from users.json and stats.json if DB is empty."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            # Migrate users
+            (user_count_db,) = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+            if user_count_db == 0 and USERS_FILE.exists():
+                data = _load_json(USERS_FILE, {"users": []})
+                users = [int(u) for u in data.get("users", []) if str(u).strip()]
+                if users:
+                    conn.executemany("INSERT OR IGNORE INTO users(id) VALUES (?)", [(u,) for u in users])
+            # Migrate stats
+            row = conn.execute("SELECT files, storage_bytes FROM stats WHERE id=1").fetchone()
+            if row is not None and row[0] == 0 and row[1] == 0 and STATS_FILE.exists():
+                s = _load_json(STATS_FILE, {"files": 0, "storage_bytes": 0})
+                files = int(s.get("files", 0) or 0)
+                storage_bytes = int(s.get("storage_bytes", 0) or 0)
+                conn.execute(
+                    "UPDATE stats SET files = ?, storage_bytes = ? WHERE id=1",
+                    (files, storage_bytes),
+                )
+    except Exception as e:
+        logger.error(f"Error migrating JSON to DB: {e}")
+
+# Initialize DB and attempt migration on startup
+init_db()
+migrate_json_to_db()
+
+def track_user(user_id: int):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("INSERT OR IGNORE INTO users(id) VALUES (?)", (int(user_id),))
+    except Exception as e:
+        logger.error(f"Error tracking user in DB: {e}")
+
+def total_users() -> int:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            (n,) = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+            return int(n)
+    except Exception as e:
+        logger.error(f"Error counting users in DB: {e}")
+        data = _load_json(USERS_FILE, {"users": []})
+        return len(data.get("users", []))
+
+def get_stats():
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            row = conn.execute("SELECT files, storage_bytes FROM stats WHERE id=1").fetchone()
+            if row is None:
+                return {"files": 0, "storage_bytes": 0}
+            return {"files": int(row[0]), "storage_bytes": int(row[1])}
+    except Exception as e:
+        logger.error(f"Error reading stats from DB: {e}")
+        return {"files": 0, "storage_bytes": 0}
+
+def bump_stats(file_path: str | None):
+    add_bytes = 0
+    try:
+        if file_path and os.path.exists(file_path):
+            add_bytes = os.path.getsize(file_path)
+    except Exception:
+        add_bytes = 0
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute(
+                "UPDATE stats SET files = files + 1, storage_bytes = storage_bytes + ? WHERE id=1",
+                (int(add_bytes),),
+            )
+    except Exception as e:
+        logger.error(f"Error updating stats in DB: {e}")
+
+def format_bytes(n: int) -> str:
+    for unit in ["B","KB","MB","GB","TB"]:
+        if n < 1024:
+            return f"{n:.2f} {unit}"
+        n /= 1024
+    return f"{n:.2f} PB"
+
+def fmt_uptime(seconds: float) -> str:
+    seconds = int(seconds)
+    h, r = divmod(seconds, 3600)
+    m, s = divmod(r, 60)
+    return f"{h:02d}h{m:02d}m{s:02d}s"
+
+def is_admin(user_id: int) -> bool:
+    admin_list = [int(x) for x in str(ADMIN_IDS).split(',') if x.strip()] if ADMIN_IDS else []
+    return user_id in admin_list
+
+def admin_only(func):
+    async def wrapper(client, message, *args, **kwargs):
+        if not is_admin(message.from_user.id):
+            await client.send_message(message.chat.id, "❌ Admins only.")
+            return
+        return await func(client, message, *args, **kwargs)
+    return wrapper
+
+try:
+    # This is for the timeout decorator
+    import signal
 except ImportError:
-    print("❌ PyPDF2 is not installed!")
-    print("Execute: pip install PyPDF2==3.0.1")
-    sys.exit(1)
+    signal = None
+
+# ... (le reste des imports)
+
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -174,6 +377,142 @@ user_batches = defaultdict(list)  # {user_id: [docs]}
 TEMP_DIR = Path("temp_files")
 TEMP_DIR.mkdir(exist_ok=True)
 cleanup_task_started = False  # Flag pour éviter de démarrer plusieurs fois la tâche
+
+# ===== PDF user settings and helpers (banner/password/extract) =====
+BANNERS_DIR = Path("banners")
+BANNERS_DIR.mkdir(exist_ok=True)
+PDF_SETTINGS_FILE = Path("pdf_settings.json")
+
+# Optional dependencies
+try:
+    import fitz  # PyMuPDF
+except Exception:  # pragma: no cover
+    fitz = None
+
+try:
+    from PIL import Image
+except Exception:  # pragma: no cover
+    Image = None
+
+from pikepdf import PasswordError
+
+
+def _load_pdf_settings():
+    try:
+        if PDF_SETTINGS_FILE.exists():
+            with open(PDF_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error(f"Error loading PDF settings: {e}")
+    return {}
+
+
+def _save_pdf_settings(data: dict) -> None:
+    try:
+        with open(PDF_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Error saving PDF settings: {e}")
+
+
+def get_user_pdf_settings(user_id: int) -> dict:
+    data = _load_pdf_settings()
+    return data.get(str(user_id), {"banner_path": None, "lock_password": None})
+
+
+def update_user_pdf_settings(user_id: int, **patch) -> dict:
+    data = _load_pdf_settings()
+    current = data.get(str(user_id), get_user_pdf_settings(user_id))
+    current.update(patch)
+    data[str(user_id)] = current
+    _save_pdf_settings(data)
+    return current
+
+
+def _image_to_pdf(img_path: str) -> str:
+    if Image is None:
+        raise RuntimeError("Pillow not installed. Please `pip install pillow`.")
+    out_pdf = BANNERS_DIR / (Path(img_path).stem + ".pdf")
+    with Image.open(img_path) as im:
+        if im.mode in ("RGBA", "P"):
+            im = im.convert("RGB")
+        im.save(out_pdf, "PDF", resolution=100.0)
+    return str(out_pdf)
+
+
+def _ensure_banner_pdf_path(user_id: int) -> str | None:
+    banner_path = get_user_pdf_settings(user_id).get("banner_path")
+    if not banner_path or not os.path.exists(banner_path):
+        return None
+    return banner_path if banner_path.lower().endswith(".pdf") else _image_to_pdf(banner_path)
+
+
+def add_banner_pages_to_pdf(in_pdf: str, out_pdf: str, banner_pdf: str, place: str = "before") -> None:
+    with pikepdf.open(in_pdf) as pdf, pikepdf.open(banner_pdf) as banner:
+        banner_pages = list(banner.pages)
+        if place in ("before", "both", None, ""):
+            for p in reversed(banner_pages):
+                pdf.pages.insert(0, p)
+        if place in ("after", "both"):
+            for p in banner_pages:
+                pdf.pages.append(p)
+        pdf.save(out_pdf)
+
+
+def lock_pdf_with_password(in_pdf: str, out_pdf: str, password: str) -> None:
+    with pikepdf.open(in_pdf) as pdf:
+        enc = pikepdf.Encryption(user=password, owner=password, R=4)
+        pdf.save(out_pdf, encryption=enc)
+
+
+def extract_page_to_png(pdf_path: str, page_number_1based: int, out_png: str, zoom: float = 2.0) -> str:
+    if fitz is None:
+        raise RuntimeError("PyMuPDF not installed. Please `pip install pymupdf`.")
+    with fitz.open(pdf_path) as doc:
+        if page_number_1based < 1 or page_number_1based > len(doc):
+            raise ValueError(f"Page {page_number_1based} out of bounds (1..{len(doc)})")
+        page = doc[page_number_1based - 1]
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        pix.save(out_png)
+    return out_png
+
+
+def parse_pages_spec(spec: str) -> list[int]:
+    spec = (spec or "").strip().lower()
+    if not spec or spec in {"none", "0", "no", "non", "skip"}:
+        return []
+    pages: set[int] = set()
+    for chunk in spec.replace(" ", "").split(","):
+        if not chunk:
+            continue
+        if "-" in chunk:
+            a, b = chunk.split("-", 1)
+            if a.isdigit() and b.isdigit():
+                a_i, b_i = int(a), int(b)
+                if a_i <= b_i:
+                    pages.update(range(a_i, b_i + 1))
+        elif chunk.isdigit():
+            pages.add(int(chunk))
+    return sorted(p for p in pages if p >= 1)
+
+
+def unlock_pdf(in_pdf: str, out_pdf: str, password: str) -> None:
+    with pikepdf.open(in_pdf, password=password) as pdf:
+        pdf.save(out_pdf)
+
+
+def remove_pages_by_numbers(in_pdf: str, out_pdf: str, one_based_pages: list[int]) -> None:
+    with pikepdf.open(in_pdf) as pdf:
+        if not one_based_pages:
+            pdf.save(out_pdf)
+            return
+        n = len(pdf.pages)
+        for p in sorted(set(one_based_pages), reverse=True):
+            if 1 <= p <= n:
+                del pdf.pages[p - 1]
+        if len(pdf.pages) == 0:
+            raise ValueError("All pages were removed; result would be empty.")
+        pdf.save(out_pdf)
 
 # Protection globale contre les doublons et rate limiting
 processed_messages = {}
@@ -217,7 +556,7 @@ def is_duplicate_message(user_id, message_id, command_type="message"):
         if user_id in user_last_command:
             last_cmd, last_time = user_last_command[user_id]
             if last_cmd == command_type and (current_time - last_time).total_seconds() < 2:
-                logger.info(f"Commande {command_type} ignorée - répétée trop rapidement pour user {user_id}")
+                logger.info(f"Command {command_type} ignored - repeated too quickly for user {user_id}")
                 return True
         user_last_command[user_id] = (command_type, current_time)
     
@@ -281,64 +620,94 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-# 🔥 FONCTIONS FORCE JOIN CHANNEL 🔥
+""" FORCE JOIN (multi-channels, persistant) """
+DEFAULT_FORCE_JOIN = []  # ex: ["djd208"]
+FORCE_JOIN_REQUIRE_ALL = False
+
+def get_forced_channels() -> List[str]:
+    data = _load_json(FJ_FILE, {"channels": DEFAULT_FORCE_JOIN})
+    chans: list[str] = []
+    for ch in data.get("channels", []):
+        c = str(ch).strip().lstrip("@").lstrip("#")
+        if c:
+            if c not in chans:
+                chans.append(c)
+    data["channels"] = chans
+    _save_json(FJ_FILE, data)
+    return chans
+
+def set_forced_channels(channels: List[str]):
+    norm: list[str] = []
+    for ch in channels:
+        c = str(ch).strip().lstrip("@").lstrip("#")
+        if c and c not in norm:
+            norm.append(c)
+    _save_json(FJ_FILE, {"channels": norm})
+
+def add_forced_channels(channels: List[str]) -> List[str]:
+    current = set(get_forced_channels())
+    for ch in channels:
+        c = str(ch).strip().lstrip("@").lstrip("#")
+        if c:
+            current.add(c)
+    set_forced_channels(list(current))
+    return get_forced_channels()
+
+def del_forced_channels(channels: List[str]) -> List[str]:
+    current = set(get_forced_channels())
+    for ch in channels:
+        c = str(ch).strip().lstrip("@").lstrip("#")
+        if c in current:
+            current.remove(c)
+    set_forced_channels(list(current))
+    return get_forced_channels()
+
 async def is_user_in_channel(user_id):
-    """Vérifie si l'utilisateur est membre du canal"""
-    # Exemption pour les admins
-    admin_list = [int(x) for x in str(ADMIN_IDS).split(',') if x.strip()] if ADMIN_IDS else []
-    if user_id in admin_list:
-        logger.info(f"🔓 User {user_id} is admin - bypassing channel check")
+    # Admins bypass
+    if is_admin(user_id):
         return True
-    
-    logger.info(f"🔍 Checking channel membership for user {user_id} in @{FORCE_JOIN_CHANNEL}")
-    
-    try:
-        member = await app.get_chat_member(FORCE_JOIN_CHANNEL, user_id)
-        status = member.status
-        logger.info(f"🔍 Member status for user {user_id}: {status}")
-        
-        # Accepter tous les statuts valides avec les constantes Pyrogram
-        valid_statuses = [
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR, 
-            ChatMemberStatus.OWNER  # ✅ Pyrogram utilise OWNER, pas CREATOR
-        ]
-        
-        # Debug: afficher tous les statuts possibles pour comparaison
-        logger.info(f"🔍 Valid statuses: {valid_statuses}")
-        logger.info(f"🔍 User status: {status} (type: {type(status)})")
-        
-        if status in valid_statuses:
-            logger.info(f"✅ User {user_id} is member of channel (status: {status})")
-            return True
-        else:
-            logger.info(f"❌ User {user_id} is not member (status: {status})")
+
+    channels = get_forced_channels()
+    if not channels:
+        return True
+
+    valid_statuses = [
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.OWNER,
+    ]
+
+    async def in_one(ch: str) -> bool:
+        try:
+            member = await app.get_chat_member(ch, user_id)
+            return member.status in valid_statuses
+        except UserNotParticipant:
             return False
-    except UserNotParticipant:
-        logger.error(f"❌ User {user_id} is not participant in channel {FORCE_JOIN_CHANNEL}")
-        return False
-    except ChatAdminRequired:
-        logger.error(f"❌ Bot is not admin in channel {FORCE_JOIN_CHANNEL}")
-        return True  # On laisse passer pour éviter de bloquer
-    except UsernameNotOccupied:
-        logger.error(f"❌ Channel {FORCE_JOIN_CHANNEL} does not exist")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Error checking channel membership for user {user_id}: {e}")
-        return True  # En cas d'erreur, on laisse passer
+        except ChatAdminRequired:
+            return True
+        except UsernameNotOccupied:
+            return True
+        except Exception as e:
+            logger.error(f"check member error @{ch}: {e}")
+            return True
+
+    results = []
+    for ch in channels:
+        results.append(await in_one(ch))
+    return all(results) if FORCE_JOIN_REQUIRE_ALL else any(results)
 
 async def send_force_join_message(client, message):
-    """Envoie le message demandant de rejoindre le canal"""
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"📢 Join @{FORCE_JOIN_CHANNEL}", url=f"https://t.me/{FORCE_JOIN_CHANNEL}")],
-        [InlineKeyboardButton("✅ I have joined", callback_data="check_joined")]
-    ])
-    
-    await client.send_message(
-        message.chat.id,
-        MESSAGES['force_join'].format(channel=FORCE_JOIN_CHANNEL),
-        reply_markup=keyboard
+    channels = get_forced_channels()
+    if not channels:
+        return
+    rows = [[InlineKeyboardButton(f"📢 Join @{ch}", url=f"https://t.me/{ch}")] for ch in channels]
+    rows.append([InlineKeyboardButton("✅ I have joined", callback_data="check_joined")])
+    txt = (
+        "🚫 *Access Denied!*\n\nTo use this bot, you must first join our channel(s):\n"
+        + "\n".join([f"👉 @{c}" for c in channels])
+        + "\n\n✅ Click the button(s) above to join.\nOnce done, tap I have joined to continue.\n\n_Thank you for your support!_"
     )
+    await client.send_message(message.chat.id, txt, reply_markup=InlineKeyboardMarkup(rows))
 
 def get_user_temp_dir(user_id):
     """Retourne le dossier temporaire spécifique à l'utilisateur"""
@@ -368,18 +737,17 @@ def extract_and_clean_pdf_text(page):
 
 def replace_username_in_filename(filename, new_username=None):
     """
-    Nettoie et modifie automatiquement le nom du fichier PDF pour inclure le @username proprement à la fin.
+    Nettoie et modifie automatiquement le nom du fichier pour inclure le hashtag/username à la fin.
+    Supprime les blocs avec @ ou #, les emojis, et ajoute le tag personnalisé.
     """
     base, ext = os.path.splitext(filename)
     
-    # Supprime TOUS les anciens usernames
-    base = re.sub(r'[\[\(\{\s]*@\w+[\]\)\}\s]*', '', base, flags=re.IGNORECASE)
-    base = re.sub(r'\s+', ' ', base).strip()
+    # Utilise la nouvelle fonction de nettoyage
+    base = clean_filename(base)
     
+    # Ajoute le tag personnalisé (username, hashtag, emoji, etc.)
     if new_username:
-        if not new_username.startswith('@'):
-            new_username = f"@{new_username}"
-        base = f"{base} {new_username}"
+        base = f"{base} {new_username}".strip()
     
     return f"{base}{ext}"
 
@@ -431,6 +799,8 @@ async def send_and_delete(client, chat_id, file_path, file_name, caption=None, d
                 # PAS de reply_markup=keyboard ici !
             )
             logger.info(f"✅ Document envoyé avec succès - ID: {sent.id}")
+            # Statistiques de traitement
+            bump_stats(file_path)
 
             # Planifier la suppression
             async def delete_after_delay():
@@ -482,6 +852,7 @@ async def send_optimized_pdf(client, chat_id, original_file_path, new_file_name,
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
+    track_user(message.from_user.id)
     global cleanup_task_started
     user_id = message.from_user.id
     
@@ -521,13 +892,13 @@ async def start_handler(client, message: Message):
     
     logger.info(f"Start command received from user {user_id}")
     
-    # Démarrer la tâche de nettoyage au premier appel
+    # Start the cleanup task on first call
     if not cleanup_task_started:
         asyncio.create_task(cleanup_temp_files())
         cleanup_task_started = True
-        logger.info("Tâche de nettoyage périodique démarrée")
+        logger.info("Periodic cleanup task started")
     
-    # NOUVEAU: Charger le username sauvegardé
+    # NEW: Load saved username
     saved_username = get_saved_username(user_id)
     
     # Réinitialiser complètement la session
@@ -536,7 +907,7 @@ async def start_handler(client, message: Message):
     user_batches[user_id].clear()
     session.clear()
     
-    # NOUVEAU: Restaurer le username depuis le fichier
+    # NEW: Restore username from file
     if saved_username:
         session['username'] = saved_username
         logger.info(f"📂 Username restored from file for user {user_id}: {saved_username}")
@@ -546,7 +917,7 @@ async def start_handler(client, message: Message):
     
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
-        [InlineKeyboardButton("📦 Batch Mode", callback_data="batch_mode")]
+        [InlineKeyboardButton("📦 Sequence Mode", callback_data="batch_mode")]
     ])
     
     await client.send_message(message.chat.id, MESSAGES['start'], reply_markup=keyboard)
@@ -554,6 +925,7 @@ async def start_handler(client, message: Message):
 @app.on_message(filters.command("batch") & filters.private)
 async def batch_command(client, message: Message):
     user_id = message.from_user.id
+    track_user(user_id)
     
     # S'assurer que la session existe et mettre à jour l'activité
     session = ensure_session_dict(user_id)
@@ -574,11 +946,11 @@ async def batch_command(client, message: Message):
         logger.info(f"Batch command ignored - {duplicate_check} for user {user_id}")
         return
     
-    logger.info(f"🔍 batch_command appelé - User {user_id} - Time: {datetime.now()}")
+    logger.info(f"🔍 batch_command called - User {user_id} - Time: {datetime.now()}")
     
-    # Protection contre les doubles appels
+    # Protection against double calls
     if session.get('batch_command_processing'):
-        logger.info(f"🔍 batch_command ignoré - déjà en cours pour user {user_id}")
+        logger.info(f"🔍 batch_command ignored - already in progress for user {user_id}")
         return
     
     session['batch_command_processing'] = True
@@ -594,7 +966,7 @@ async def batch_command(client, message: Message):
     if count > 0:
         await client.send_message(
             message.chat.id,
-            f"📦 **Batch Mode**\n\n"
+            f"📦 **Sequence Mode**\n\n"
             f"✅ You have {count} file(s) waiting\n"
             f"📊 Maximum: {MAX_BATCH_FILES} files\n\n"
             f"🎥 Videos are downloaded immediately to avoid session expiration\n"
@@ -604,7 +976,7 @@ async def batch_command(client, message: Message):
     else:
         await client.send_message(
             message.chat.id,
-            f"📦 **Batch Mode**\n\n"
+            f"📦 **Sequence Mode**\n\n"
             f"📭 No files waiting\n\n"
             f"✅ You can send up to {MAX_BATCH_FILES} files\n"
             f"🎥 Videos will be downloaded immediately to avoid session expiration\n"
@@ -619,6 +991,7 @@ async def batch_command(client, message: Message):
 @app.on_message(filters.command("process") & filters.private)
 async def process_batch_command(client, message: Message):
     user_id = message.from_user.id
+    track_user(user_id)
     
     # 🔥 VÉRIFICATION FORCE JOIN 🔥
     if not await is_user_in_channel(user_id):
@@ -635,11 +1008,11 @@ async def process_batch_command(client, message: Message):
         logger.info(f"Process command ignored - {duplicate_check} for user {user_id}")
         return
     
-    logger.info(f"🔍 process_batch_command appelé - User {user_id} - Time: {datetime.now()}")
+    logger.info(f"🔍 process_batch_command called - User {user_id} - Time: {datetime.now()}")
     
-    # Protection contre les doubles appels
+    # Protection against double calls
     if sessions.get(user_id, {}).get('process_command_processing'):
-        logger.info(f"🔍 process_batch_command ignoré - déjà en cours pour user {user_id}")
+        logger.info(f"🔍 process_batch_command ignored - already in progress for user {user_id}")
         return
     
     sessions[user_id] = sessions.get(user_id, {})
@@ -685,7 +1058,7 @@ async def process_batch_command(client, message: Message):
             # Supprimer la vidéo traitée du batch
             batch_files.remove(entry)
 
-    # 2️⃣ Ensuite : afficher le menu si des PDF restent dans le batch
+    # 2️⃣ Ensuite : afficher le menu si des PDF restent dans la séquence
     pdf_files = [f for f in batch_files if not f.get('is_video')]
     if pdf_files:
         keyboard = InlineKeyboardMarkup([
@@ -693,11 +1066,11 @@ async def process_batch_command(client, message: Message):
             [InlineKeyboardButton("🔓 Unlock all", callback_data=f"batch_unlock:{user_id}")],
             [InlineKeyboardButton("🗑️ Remove pages (all)", callback_data=f"batch_pages:{user_id}")],
             [InlineKeyboardButton("🛠️ The Both (all)", callback_data=f"batch_both:{user_id}")],
-            [InlineKeyboardButton("🧹 Clear batch", callback_data=f"batch_clear:{user_id}")]
+            [InlineKeyboardButton("🧹 Clear sequence", callback_data=f"batch_clear:{user_id}")]
         ])
         await client.send_message(
             message.chat.id,
-            f"📦 **Batch Processing**\n\n"
+            f"📦 **Sequence Processing**\n\n"
             f"{len(pdf_files)} PDF(s) ready\n\n"
             f"What do you want to do?",
             reply_markup=keyboard
@@ -708,33 +1081,45 @@ async def process_batch_command(client, message: Message):
     # 3️⃣ S'il ne reste plus de PDF ni vidéo : tout a été traité
     await client.send_message(
         message.chat.id,
-        "✅ All videos processed!\n\nSend more files or /start to exit batch mode."
+        "✅ All videos processed!\n\nSend more files or /start to exit sequence mode."
     )
     user_batches[user_id].clear()
     sessions[user_id]['process_command_processing'] = False
 
+def build_pdf_actions_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧹 Clean usernames", callback_data=f"clean_username:{user_id}")],
+        [InlineKeyboardButton("🔓 Unlock", callback_data=f"unlock:{user_id}")],
+        [InlineKeyboardButton("🗑️ Remove pages", callback_data=f"pages:{user_id}")],
+        [InlineKeyboardButton("🛠️ The Both", callback_data=f"both:{user_id}")],
+        [InlineKeyboardButton("🪧 Add banner", callback_data=f"add_banner:{user_id}")],
+        [InlineKeyboardButton("🔐 Lock", callback_data=f"lock_now:{user_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")],
+    ])
+
 @app.on_message(filters.document & filters.private)
 async def handle_document(client, message: Message):
     user_id = message.from_user.id
+    track_user(user_id)
     
     # S'assurer que la session existe et mettre à jour l'activité
     session = ensure_session_dict(user_id)
     session['last_activity'] = datetime.now()
     
-    # NOUVEAU: Ignorer si c'est le bot qui envoie
+    # NEW: Ignore if it's the bot sending
     if message.from_user.is_bot:
         logger.info(f"Document ignored - sent by the bot itself")
         return
     
-    # 🔥 CORRECTION BATCH: Ne pas bloquer en mode batch
+    # 🔥 BATCH CORRECTION: Don't block in batch mode
     if not session.get('batch_mode'):
-        # NOUVEAU: Ignorer si on vient de traiter un fichier (MODE NORMAL SEULEMENT)
+        # NEW: Ignore if we just processed a file (NORMAL MODE ONLY)
         if session.get('just_processed'):
             logger.info(f"Document ignored - file was just processed")
             session['just_processed'] = False
             return
         
-        # Vérifier si on traite déjà quelque chose (MODE NORMAL SEULEMENT)
+        # Check if we're already processing something (NORMAL MODE ONLY)
         if session.get('processing'):
             logger.info(f"Document ignored - processing in progress for user {user_id}")
             return
@@ -809,8 +1194,8 @@ async def handle_document(client, message: Message):
         logger.info(f"📦 BATCH: File added for user {user_id} - Total: {len(user_batches[user_id])}")
         return
     
-    # Mode normal - créer une nouvelle session
-    # NOUVEAU: Charger le username depuis le fichier persistant
+    # Normal mode - create a new session
+    # NEW: Load username from persistent file
     saved_username = get_saved_username(user_id)
     delete_delay = session.get('delete_delay', AUTO_DELETE_DELAY)
     
@@ -820,7 +1205,7 @@ async def handle_document(client, message: Message):
         'last_activity': datetime.now()
     })
     
-    # NOUVEAU: Restaurer le username depuis le fichier
+    # NEW: Restore username from file
     if saved_username:
         session['username'] = saved_username
     if delete_delay != AUTO_DELETE_DELAY:
@@ -829,13 +1214,7 @@ async def handle_document(client, message: Message):
     # Créer le menu selon le type de fichier
     if is_pdf_file(file_name):
         # Menu complet pour les PDF
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🧹 Clean usernames", callback_data=f"clean_username:{user_id}")],
-            [InlineKeyboardButton("🔓 Unlock", callback_data=f"unlock:{user_id}")],
-            [InlineKeyboardButton("🗑️ Remove pages", callback_data=f"pages:{user_id}")],
-            [InlineKeyboardButton("🛠️ The Both", callback_data=f"both:{user_id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")]
-        ])
+        keyboard = build_pdf_actions_keyboard(user_id)
         message_text = f"📄 PDF received: {file_name}\n\nWhat do you want to do?"
     else:
         # Pas de menu pour les vidéos - elles sont gérées par handle_video_document
@@ -851,6 +1230,7 @@ async def handle_document(client, message: Message):
 @app.on_message(filters.video & filters.private)
 async def handle_video(client, message: Message):
     user_id = message.from_user.id
+    track_user(user_id)
     
     # S'assurer que la session existe et mettre à jour l'activité
     session = ensure_session_dict(user_id)
@@ -911,10 +1291,12 @@ async def handle_video(client, message: Message):
             f"What do you want to do with this video?"
         )
     else:
-        # Mode normal - seulement Edit Name + Cancel
+        # Normal mode - only Edit Name + Cancel
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("✏️ Edit Name", callback_data=f"video_edit_name:{user_id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")]
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")],
+            [InlineKeyboardButton("🪧 Add banner", callback_data=f"add_banner:{user_id}")],
+            [InlineKeyboardButton("🔐 Lock", callback_data=f"lock_now:{user_id}")],
         ])
     
     await client.send_message(
@@ -925,14 +1307,14 @@ async def handle_video(client, message: Message):
 
 
 async def handle_video_document(client, message: Message, doc):
-    """Traite les vidéos envoyées comme documents"""
+    """Processes videos sent as documents"""
     user_id = message.from_user.id
     
-    # S'assurer que la session existe et mettre à jour l'activité
+    # Ensure session exists and update activity
     session = ensure_session_dict(user_id)
     session['last_activity'] = datetime.now()
     
-    # Sauvegarder les infos de la vidéo
+    # Save video information
     session['video_file_id'] = doc.file_id
     session['video_file_name'] = doc.file_name or "video.mp4"
     session['video_message_id'] = message.id
@@ -940,9 +1322,9 @@ async def handle_video_document(client, message: Message, doc):
     
     logger.info(f"🎥 Video document received from user {user_id}: {session['video_file_name']}")
     
-    # Créer le menu selon le mode
+    # Create menu according to mode
     if session.get('batch_mode'):
-        # Mode batch - PAS DE TÉLÉCHARGEMENT, juste stocker les infos
+        # Batch mode - NO DOWNLOAD, just store information
         if user_id not in user_batches:
             user_batches[user_id] = []
             
@@ -950,27 +1332,29 @@ async def handle_video_document(client, message: Message, doc):
             await client.send_message(message.chat.id, f"❌ Limit of {MAX_BATCH_FILES} files reached!")
             return
         
-        # Ajouter au batch SANS téléchargement
+        # Add to batch WITHOUT download
         user_batches[user_id].append({
             'file_id': doc.file_id,
             'file_name': doc.file_name or "video.mp4",
             'is_video': True,
             'message_id': message.id,
-            'caption': message.caption or "",  # Caption originale
+            'caption': message.caption or "",  # Original caption
             'size': doc.file_size
         })
         
-        # Ajout vidéo en batch (sans boutons)
+        # Video added to batch (no buttons)
         await client.send_message(
             message.chat.id,
             f"✅ Video added to batch ({len(user_batches[user_id])}/{MAX_BATCH_FILES})\n\n"
             f"What do you want to do with this video?"
         )
     else:
-        # Mode normal - seulement Edit Name + Cancel
+        # Normal mode - only Edit Name + Cancel
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("✏️ Edit Name", callback_data=f"video_edit_name:{user_id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")]
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")],
+            [InlineKeyboardButton("🪧 Add banner", callback_data=f"add_banner:{user_id}")],
+            [InlineKeyboardButton("🔐 Lock", callback_data=f"lock_now:{user_id}")],
         ])
         
         await client.send_message(
@@ -984,18 +1368,18 @@ async def handle_video_document(client, message: Message, doc):
 @app.on_callback_query(filters.regex("^check_joined$"))
 async def check_joined_handler(client, query: CallbackQuery):
     user_id = query.from_user.id
-    logger.info(f"🔍 check_joined_handler appelé pour user {user_id}")
+    logger.info(f"🔍 check_joined_handler called for user {user_id}")
     
     is_member = await is_user_in_channel(user_id)
-    logger.info(f"🔍 Résultat vérification membership pour user {user_id}: {is_member}")
+    logger.info(f"🔍 Membership verification result for user {user_id}: {is_member}")
     
     if is_member:
         await query.answer("✅ Thank you! You can now use the bot.", show_alert=True)
         await query.message.delete()
-        # Afficher le message de bienvenue
+        # Show welcome message
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
-            [InlineKeyboardButton("📦 Batch Mode", callback_data="batch_mode")]
+            [InlineKeyboardButton("📦 Sequence Mode", callback_data="batch_mode")]
         ])
         await client.send_message(user_id, MESSAGES['start'], reply_markup=keyboard)
         logger.info(f"✅ User {user_id} successfully verified and welcome message sent")
@@ -1020,13 +1404,12 @@ async def remove_last_page(client, query: CallbackQuery):
     
     # Calculate the last page automatically
     file_path = await client.download_media(file_id, file_name=f"{get_user_temp_dir(user_id)}/temp.pdf")
-    with open(file_path, 'rb') as f:
-        reader = PdfReader(f)
-        if reader.is_encrypted:
-            await query.edit_message_text("❌ Cannot delete page (PDF protected)")
-            return
-        last_page = len(reader.pages)
-    await remove_page_logic(client, query, user_id, page_number=last_page)
+    try:
+        with pikepdf.open(file_path) as pdf:
+            last_page = len(pdf.pages)
+        await remove_page_logic(client, query, user_id, page_number=last_page)
+    except pikepdf.PasswordError:
+        await query.edit_message_text("❌ Cannot delete page (PDF protected)")
 
 @app.on_callback_query(filters.regex(r"^the_middle:(\d+)$"))
 async def remove_middle_page(client, query: CallbackQuery):
@@ -1039,14 +1422,13 @@ async def remove_middle_page(client, query: CallbackQuery):
     
     # Calculate the middle page
     file_path = await client.download_media(file_id, file_name=f"{get_user_temp_dir(user_id)}/temp.pdf")
-    with open(file_path, 'rb') as f:
-        reader = PdfReader(f)
-        if reader.is_encrypted:
-            await query.edit_message_text("❌ Cannot delete page (PDF protected)")
-            return
-        total_pages = len(reader.pages)
-        middle_page = total_pages // 2 if total_pages % 2 == 0 else (total_pages // 2) + 1
-    await remove_page_logic(client, query, user_id, page_number=middle_page)
+    try:
+        with pikepdf.open(file_path) as pdf:
+            total_pages = len(pdf.pages)
+            middle_page = total_pages // 2 if total_pages % 2 == 0 else (total_pages // 2) + 1
+        await remove_page_logic(client, query, user_id, page_number=middle_page)
+    except pikepdf.PasswordError:
+        await query.edit_message_text("❌ Cannot delete page (PDF protected)")
 
 @app.on_callback_query(filters.regex(r"^enter_manually:(\d+)$"))
 async def ask_user_page_input(client, query: CallbackQuery):
@@ -1193,38 +1575,32 @@ async def remove_page_logic(client, query, user_id, page_number):
     file_path = await client.download_media(file_id, file_name=f"{get_user_temp_dir(user_id)}/input.pdf")
     
     # Check if PDF is locked
-    with open(file_path, 'rb') as f:
-        reader = PdfReader(f)
-        if reader.is_encrypted:
-            await query.edit_message_text("❌ Cannot delete page (PDF protected)")
-            return
-        
-        total_pages = len(reader.pages)
-        if page_number < 1 or page_number > total_pages:
-            await query.edit_message_text(f"❌ Invalid page number. The PDF has {total_pages} pages.")
-            return
-        
-        # Delete the page
-        writer = PdfWriter()
-        for i in range(total_pages):
-            if (i + 1) != page_number:  # Keep all pages except the one to delete
-                writer.add_page(reader.pages[i])
-        
-        # Save the modified PDF
-        output_path = f"{get_user_temp_dir(user_id)}/modified_{session.get('file_name', 'document.pdf')}"
-        with open(output_path, 'wb') as out:
-            writer.write(out)
-        
-        # Send the modified file directly (no confirmation message)
-        username = session.get('username', '')
-        new_file_name = replace_username_in_filename(session.get('file_name', 'document.pdf'), username)
-        delay = session.get('delete_delay', AUTO_DELETE_DELAY)
-        
-        await send_and_delete(client, query.message.chat.id, output_path, new_file_name, delay_seconds=delay)
-        await query.edit_message_text(f"✅ Page {page_number} deleted successfully!")
-        
-        # ✅ FIX: Reset processing flag after successful page removal
-        sessions[user_id]['processing'] = False
+    try:
+        with pikepdf.open(file_path) as pdf:
+            total_pages = len(pdf.pages)
+            if page_number < 1 or page_number > total_pages:
+                await query.edit_message_text(f"❌ Invalid page number. The PDF has {total_pages} pages.")
+                return
+            
+            # Delete the page
+            pdf.pages.pop(page_number - 1)
+            
+            # Save the modified PDF
+            output_path = f"{get_user_temp_dir(user_id)}/modified_{session.get('file_name', 'document.pdf')}"
+            pdf.save(output_path)
+            
+            # Send the modified file directly (no confirmation message)
+            username = session.get('username', '')
+            new_file_name = replace_username_in_filename(session.get('file_name', 'document.pdf'), username)
+            delay = session.get('delete_delay', AUTO_DELETE_DELAY)
+            
+            await send_and_delete(client, query.message.chat.id, output_path, new_file_name, delay_seconds=delay)
+            await query.edit_message_text(f"✅ Page {page_number} deleted successfully!")
+            
+            # ✅ FIX: Reset processing flag after successful page removal
+            sessions[user_id]['processing'] = False
+    except pikepdf.PasswordError:
+        await query.edit_message_text("❌ Cannot delete page (PDF protected)")
 
 @app.on_callback_query() 
 async def button_callback(client, query: CallbackQuery):
@@ -1259,7 +1635,7 @@ async def button_callback(client, query: CallbackQuery):
         sessions[user_id]['batch_mode'] = True
         
         await query.edit_message_text(
-            f"📦 **Batch Mode Activated**\n\n"
+            f"📦 **Sequence Mode Activated**\n\n"
             f"✅ You can now send up to {MAX_BATCH_FILES} files\n"
             f"🎥 Videos will be downloaded immediately to avoid session expiration\n"
             f"📄 PDFs will be processed when you send `/process`\n\n"
@@ -1357,9 +1733,8 @@ async def button_callback(client, query: CallbackQuery):
                 if files:
                     file = await client.download_media(files[0]['file_id'], file_name=f"{get_user_temp_dir(user_id)}/temp.pdf")
                     try:
-                        with open(file, 'rb') as f:
-                            reader = PdfReader(f)
-                            total_pages = len(reader.pages)
+                        with pikepdf.open(file) as pdf:
+                            total_pages = len(pdf.pages)
                         os.remove(file)
                         await process_batch_both(client, query.message, user_id, password, str(total_pages))
                     except Exception as e:
@@ -1382,9 +1757,8 @@ async def button_callback(client, query: CallbackQuery):
                 if files:
                     file = await client.download_media(files[0]['file_id'], file_name=f"{get_user_temp_dir(user_id)}/temp.pdf")
                     try:
-                        with open(file, 'rb') as f:
-                            reader = PdfReader(f)
-                            total_pages = len(reader.pages)
+                        with pikepdf.open(file) as pdf:
+                            total_pages = len(pdf.pages)
                         middle = total_pages // 2 if total_pages % 2 == 0 else (total_pages // 2) + 1
                         os.remove(file)
                         await process_batch_both(client, query.message, user_id, password, str(middle))
@@ -1413,15 +1787,15 @@ async def button_callback(client, query: CallbackQuery):
                     "• 1-5 → removes pages 1 to 5"
                 )
             else:
-                logger.error(f"❌ batch_both_manual - No password found for user {user_id}")
-                await query.answer("❌ Password not found. Please restart with /process", show_alert=True)
-                await safe_edit_message(query, "❌ Error: missing password.\n\nPlease use `/process` to start again.")
+                        logger.error(f"❌ batch_both_manual - No password found for user {user_id}")
+        await query.answer("❌ Password not found. Please restart with /process", show_alert=True)
+        await safe_edit_message(query, "❌ Error: missing password.\n\nPlease use `/process` to process again.")
         return
     
     # Gestion des paramètres
     if data == "settings":
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add Username", callback_data="add_username")],
+            [InlineKeyboardButton("➕ Add a #htag", callback_data="add_username")],
             [InlineKeyboardButton("⏰ Delete delay", callback_data="set_delete_delay")],
             [InlineKeyboardButton("🔙 Back", callback_data="back_to_start")]
         ])
@@ -1471,8 +1845,13 @@ async def button_callback(client, query: CallbackQuery):
         sessions[user_id]['last_activity'] = datetime.now()
         sessions[user_id]['awaiting_username'] = True
         await query.edit_message_text(
-            "Send me the [@username] to add.\n\n"
-            "Format: [@username] or [📢 @username]"
+            "Send me the text/tag to add to your files.\n\n"
+            "You can send:\n"
+            "• @username\n"
+            "• #hashtag\n"
+            "• [📢 @channel]\n"
+            "• 🔥 @fire\n"
+            "• Any text with emojis!"
         )
         logger.info(f"🔍 Username addition mode activated for user {user_id}")
         return
@@ -1482,14 +1861,14 @@ async def button_callback(client, query: CallbackQuery):
         sessions[user_id] = sessions.get(user_id, {})
         sessions[user_id]['last_activity'] = datetime.now()
         
-        logger.info(f"🔍 Delete username - User {user_id} - Username existant: {sessions[user_id].get('username')}")
+        logger.info(f"🔍 Delete username - User {user_id} - Existing username: {sessions[user_id].get('username')}")
         
-        # 🔥 Correction ici : suppression clé 'username' de la session ET du fichier persistant
+        # 🔥 Correction here: remove 'username' key from session AND persistent file
         if sessions[user_id].get('username'):
             old_username = sessions[user_id]['username']
-            sessions[user_id].pop('username', None)  # <-- bien pop la clé ici
+            sessions[user_id].pop('username', None)  # <-- properly pop the key here
             
-            # Supprimer aussi du fichier persistant
+            # Also remove from persistent file
             delete_saved_username(user_id)
             
             await query.edit_message_text(f"✅ Username deleted: {old_username}")
@@ -1502,7 +1881,7 @@ async def button_callback(client, query: CallbackQuery):
     elif data == "back_to_start":
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
-            [InlineKeyboardButton("📦 Batch Mode", callback_data="batch_mode")]
+            [InlineKeyboardButton("📦 Sequence Mode", callback_data="batch_mode")]
         ])
         await query.edit_message_text(MESSAGES['start'], reply_markup=keyboard)
         return
@@ -1562,9 +1941,10 @@ async def button_callback(client, query: CallbackQuery):
     elif action == "both":
         # Show options for "The Both" action
         both_options = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🪧 Add banner", callback_data=f"add_banner:{user_id}"), InlineKeyboardButton("🔐 Lock", callback_data=f"lock_now:{user_id}")],
             [InlineKeyboardButton("🛠️ Full Both Process", callback_data=f"both_full:{user_id}")],
             [InlineKeyboardButton("🗑️ Remove Pages Only", callback_data=f"both_remove_pages:{user_id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")]
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")],
         ])
         await query.edit_message_text(
             "🛠️ **The Both** - Combined action\n\n"
@@ -1595,6 +1975,84 @@ async def button_callback(client, query: CallbackQuery):
             reply_markup=get_remove_pages_buttons(user_id)
         )
         sessions[user_id]['processing'] = False  # Libérer le flag pour les boutons
+        return
+    elif action == "add_banner":
+        # Add default banner immediately
+        banner_pdf = _ensure_banner_pdf_path(user_id)
+        if not banner_pdf:
+            await query.edit_message_text("❌ No default banner. Use /setbanner first.")
+            sessions[user_id]['processing'] = False
+            return
+        session2 = ensure_session_dict(user_id)
+        file_id2 = session2.get('file_id')
+        file_name2 = session2.get('file_name') or 'document.pdf'
+        user_dir2 = get_user_temp_dir(user_id)
+        in_path2 = await client.download_media(file_id2, file_name=user_dir2 / 'banner_input.pdf')
+        out_path2 = str(user_dir2 / f"bannered_{file_name2}")
+        # Show processing status
+        status_msg = await client.send_message(query.message.chat.id, MESSAGES['processing'])
+        try:
+            add_banner_pages_to_pdf(in_path2, out_path2, banner_pdf, place='before')
+            delay2 = session2.get('delete_delay', AUTO_DELETE_DELAY)
+            username2 = session2.get('username')
+            await send_and_delete(client, query.message.chat.id, out_path2,
+                                  replace_username_in_filename(Path(out_path2).name, username2),
+                                  delay_seconds=delay2)
+            # Remove processing message
+            try:
+                await status_msg.delete()
+            except:
+                pass
+            await query.edit_message_text("✅ Banner added successfully!")
+        except Exception as e:
+            try:
+                await status_msg.delete()
+            except:
+                pass
+            await query.edit_message_text(f"❌ Error adding banner: {e}")
+        return
+    elif action == "lock_now":
+        # Lock current PDF using default password
+        password = get_user_pdf_settings(user_id).get('lock_password')
+        if not password:
+            await query.edit_message_text("❌ No password set. Use /setpassword first.")
+            sessions[user_id]['processing'] = False
+            return
+        session3 = ensure_session_dict(user_id)
+        file_id3 = session3.get('file_id')
+        file_name3 = session3.get('file_name') or 'document.pdf'
+        user_dir3 = get_user_temp_dir(user_id)
+        in_path3 = await client.download_media(file_id3, file_name=user_dir3 / 'lock_input.pdf')
+        out_path3 = str(user_dir3 / f"locked_{file_name3}")
+        # Show processing status
+        status_msg = await client.send_message(query.message.chat.id, MESSAGES['processing'])
+        try:
+            lock_pdf_with_password(in_path3, out_path3, password)
+            delay3 = session3.get('delete_delay', AUTO_DELETE_DELAY)
+            username3 = session3.get('username')
+            await send_and_delete(client, query.message.chat.id, out_path3,
+                                  replace_username_in_filename(Path(out_path3).name, username3),
+                                  delay_seconds=delay3)
+            # Remove processing message
+            try:
+                await status_msg.delete()
+            except:
+                pass
+            await query.edit_message_text("✅ PDF locked successfully!")
+        except pikepdf.PasswordError:
+            try:
+                await status_msg.delete()
+            except:
+                pass
+            await query.edit_message_text("❌ The PDF is locked. Please unlock it first, then try again.")
+            sessions[user_id]['processing'] = False
+            return
+        except Exception as e:
+            try:
+                await status_msg.delete()
+            except:
+                pass
+            await query.edit_message_text(f"❌ Error locking PDF: {e}")
         return
 
     # --- NEW: Handlers for both_first, both_last, both_middle, both_manual ---
@@ -1677,6 +2135,77 @@ async def handle_all_text(client, message: Message):
     
     if user_id in sessions:
         sessions[user_id]['last_activity'] = datetime.now()
+
+    # Short-circuit commands that might not be caught in some environments
+    if message.text:
+        txt = message.text.strip().lower()
+        if txt.startswith("/setbanner"):
+            await cmd_setbanner(client, message)
+            return
+        if txt.startswith("/view_banner") or txt.startswith("/viewbanner"):
+            await cmd_view_banner(client, message)
+            return
+        if txt.startswith("/setpassword"):
+            await cmd_setpassword(client, message)
+            return
+        if txt.startswith("/reset_password"):
+            await cmd_reset_password(client, message)
+            return
+        if txt.startswith("/setextra_pages"):
+            await cmd_setextra_pages(client, message)
+            return
+        if txt.startswith("/pdf_edit"):
+            await cmd_pdf_edit(client, message)
+            return
+        if txt.startswith("/addfsub"):
+            await addfsub_handler(client, message)
+            return
+        if txt.startswith("/delfsub"):
+            await delfsub_handler(client, message)
+            return
+        if txt.startswith("/channels"):
+            await channels_handler(client, message)
+            return
+        if txt.startswith("/status"):
+            await status_handler(client, message)
+            return
+
+    # NEW: Handle awaiting_new_password here as well (fallback)
+    if session.get("awaiting_new_password"):
+        pw = message.text.strip()
+        session["awaiting_new_password"] = False
+        if pw.lower() in {"none", "off", "disable"}:
+            update_user_pdf_settings(user_id, lock_password=None)
+            await client.send_message(message.chat.id, "🔓 Default password removed.")
+        else:
+            update_user_pdf_settings(user_id, lock_password=pw)
+            await client.send_message(message.chat.id, "✅ Default password updated.")
+        return
+
+    # Fallback: extraction d'une page en image (au cas où un autre handler ne capture pas)
+    if session.get("awaiting_extract_page"):
+        try:
+            page_no = int(message.text.strip())
+        except Exception:
+            await client.send_message(message.chat.id, "❌ Send a valid page number (e.g., 1)")
+            return
+
+        session["awaiting_extract_page"] = False
+        file_id = session.get("file_id")
+        file_name = session.get("file_name") or "document.pdf"
+        user_dir = get_user_temp_dir(user_id)
+        in_path = await client.download_media(file_id, file_name=user_dir / "extract_input.pdf")
+        # Vérifier si le PDF est verrouillé
+        if is_pdf_locked(in_path):
+            await client.send_message(message.chat.id, "❌ The PDF is locked. Please unlock it first, then try again.")
+            return
+        out_img = str(user_dir / f"{Path(file_name).stem}_page{page_no}.png")
+        try:
+            extract_page_to_png(in_path, page_no, out_img, zoom=2.0)
+            await client.send_photo(message.chat.id, out_img, caption=f"🖼️ Page {page_no}")
+        except Exception as e:
+            await client.send_message(message.chat.id, f"❌ Cannot extract page {page_no}: {e}")
+        return
 
     # ✅ FIX: Mot de passe pour UNLOCK
     if session.get('action') == "unlock":
@@ -1799,17 +2328,17 @@ async def handle_all_text(client, message: Message):
         logger.info(f"🔑 DEBUG: User {user_id} entered password for batch_both")
         logger.info(f"🔑 DEBUG: Password length: {len(password)}")
         
-        # IMPORTANT: S'assurer que la session existe avant de stocker le mot de passe
+        # IMPORTANT: Ensure session exists before storing password
         session = ensure_session_dict(user_id)
         session['batch_both_password'] = password
         session['awaiting_batch_both_password'] = False
         
-        # Vérifier immédiatement que le mot de passe est bien stocké
+        # Verify immediately that password is stored correctly
         stored_password = session.get('batch_both_password', '')
         logger.info(f"🔑 DEBUG: Password stored successfully? {bool(stored_password)}")
         logger.info(f"🔑 DEBUG: Session keys after storing: {list(session.keys())}")
         
-        # Log du changement de session
+        # Log session change
         log_session_change(user_id, "SET", "batch_both_password", password)
         
         # Afficher le clavier pour la sélection des pages
@@ -1857,24 +2386,24 @@ async def handle_all_text(client, message: Message):
             await message.reply(f"❌ Error: {e}")
         return
 
-    # Gestion username (paramètre)
+    # Gestion username/hashtag (paramètre)
     if session.get('awaiting_username'):
         username = message.text.strip()
-        match = re.search(r'@[\w\d_]+', username)
-        if match:
-            username_clean = match.group()
-            session['username'] = username_clean
+        
+        # Accepter n'importe quel texte (hashtag, emoji, username, etc.)
+        if username:
+            session['username'] = username
             session['awaiting_username'] = False
             
-            # NOUVEAU: Sauvegarder de manière persistante
-            if save_username(user_id, username_clean):
-                await client.send_message(message.chat.id, f"✅ Username saved: {username_clean}")
+            # NEW: Save persistently
+            if save_username(user_id, username):
+                await client.send_message(message.chat.id, f"✅ Tag saved: {username}")
             else:
-                await client.send_message(message.chat.id, f"✅ Username saved in session: {username_clean}\n⚠️ (Could not save to file)")
+                await client.send_message(message.chat.id, f"✅ Tag saved in session: {username}\n⚠️ (Could not save to file)")
             
-            logger.info(f"🔧 Username registered for user {user_id}: {username_clean}")
+            logger.info(f"🔧 Tag registered for user {user_id}: {username}")
         else:
-            await client.send_message(message.chat.id, "❌ No valid @username found in your text. Try again.")
+            await client.send_message(message.chat.id, "❌ Please send some text to use as your tag.")
         return
 
     # Gestion de la saisie manuelle des pages pour l'action "pages"
@@ -1891,6 +2420,13 @@ async def handle_all_text(client, message: Message):
         session['both_password'] = password
         session.pop('awaiting_both_password', None)
         session['awaiting_both_pages'] = True
+        
+        # Supprimer le message de l'utilisateur
+        try:
+            await message.delete()
+        except:
+            pass
+        
         await client.send_message(
             message.chat.id, 
             "✅ Password noted. Now send the pages to remove (e.g. `1,3-5`):"
@@ -1906,6 +2442,12 @@ async def handle_all_text(client, message: Message):
             await client.send_message(message.chat.id, f"❌ {error}")
             return
         
+        # Supprimer le message de l'utilisateur
+        try:
+            await message.delete()
+        except:
+            pass
+        
         # Récupérer les données nécessaires
         password = session.get('both_password', '')
         file_id = session.get('file_id')
@@ -1919,13 +2461,8 @@ async def handle_all_text(client, message: Message):
         
         # Traitement du PDF
         try:
-            # Supprimer le message de l'utilisateur
-            try:
-                await message.delete()
-            except:
-                pass
-            
-            status = await client.send_message(message.chat.id, MESSAGES['processing'])
+            # Message de traitement en cours
+            processing_msg = await client.send_message(message.chat.id, "⏳ Processing in progress, please wait...")
             
             file = await client.download_media(file_id, file_name=f"{get_user_temp_dir(user_id)}/input.pdf")
             
@@ -1934,60 +2471,51 @@ async def handle_all_text(client, message: Message):
                 output_path = Path(temp_dir) / f"both_{file_name}"
                 shutil.move(file, input_path)
                 
-                with open(input_path, 'rb') as f:
-                    reader = PdfReader(f)
+                with pikepdf.open(input_path, password=password if password.lower() != 'none' else '', allow_overwriting_input=True) as pdf:
+                    total_pages = len(pdf.pages)
                     
-                    # Déverrouiller si nécessaire
-                    if reader.is_encrypted:
-                        if password.lower() != 'none' and not reader.decrypt(password):
-                            await status.edit_text("❌ Incorrect password.")
-                            sessions.pop(user_id, None)
-                            return
+                    pages_to_keep = [p for i, p in enumerate(pdf.pages) if (i + 1) not in pages_to_remove]
                     
-                    total_pages = len(reader.pages)
-                    writer = PdfWriter()
-                    kept = 0
-                    
-                    # Supprimer les pages spécifiées
-                    for j in range(total_pages):
-                        if (j + 1) not in pages_to_remove:
-                            writer.add_page(reader.pages[j])
-                            kept += 1
-                    
-                    if kept == 0:
-                        await status.edit_text("❌ No pages remaining after removal.")
+                    if not pages_to_keep:
+                        await processing_msg.edit_text("❌ No pages remaining after removal.")
                         sessions.pop(user_id, None)
                         return
-                    
-                    with open(output_path, 'wb') as out:
-                        writer.write(out)
+                        
+                    new_pdf = pikepdf.new()
+                    for page in pages_to_keep:
+                        new_pdf.pages.append(page)
+                        
+                    new_pdf.save(output_path)
                 
                 # Nettoyer le nom du fichier
                 cleaned_name = replace_username_in_filename(file_name, username)
                 
-                # Supprimer le message de statut
-                try:
-                    await status.delete()
-                except:
-                    pass
+                # Envoyer le fichier AVANT le message de succès
+                delay = session.get('delete_delay', AUTO_DELETE_DELAY)
+                await send_and_delete(client, message.chat.id, output_path, cleaned_name, delay_seconds=delay)
                 
-                # Envoyer le message de succès
+                # Envoyer le message de succès APRÈS le fichier
                 await client.send_message(
                     message.chat.id,
-                    f"✅ **The Both** completed successfully!\n\n"
+                    f"✅ The Both completed successfully!\n\n"
                     f"• PDF unlocked\n"
                     f"• Pages {pages_text} removed\n"
                     f"• Usernames cleaned\n"
                     f"• Custom username added: {username if username else 'None'}"
                 )
                 
-                # Envoyer le fichier
-                delay = session.get('delete_delay', AUTO_DELETE_DELAY)
-                await send_and_delete(client, message.chat.id, output_path, cleaned_name, delay_seconds=delay)
+                # Supprimer le message de traitement
+                try:
+                    await processing_msg.delete()
+                except:
+                    pass
                         
         except Exception as e:
             logger.error(f"Error process_both_final: {e}")
-            await status.edit_text(MESSAGES['error'])
+            try:
+                await processing_msg.edit_text("❌ Error processing PDF")
+            except:
+                await client.send_message(message.chat.id, "❌ Error processing PDF")
         finally:
             # Nettoyer tout à la fin
             user_batches[user_id].clear()
@@ -2039,7 +2567,11 @@ async def process_batch_unlock(client, message, user_id, password):
         sessions[user_id]['processing'] = False
         return
     
-    logger.info(f"🔍 Début process_batch_unlock - User {user_id} - Time: {datetime.now()}")
+    # Récupérer le username depuis la session
+    session = ensure_session_dict(user_id)
+    username = session.get('username', '')
+    
+    logger.info(f"🔍 Start process_batch_unlock - User {user_id} - Time: {datetime.now()}")
     status = await create_or_edit_status(client, message, f"⏳ Processing {len(pdf_files)} PDF files...")
     success_count = 0
     error_count = 0
@@ -2056,31 +2588,8 @@ async def process_batch_unlock(client, message, user_id, password):
                     output_path = Path(temp_dir) / f"unlocked_{file_info['file_name']}"
                     shutil.move(file, input_path)
                     
-                    with open(input_path, 'rb') as f:
-                        reader = PdfReader(f)
-                        # Déverrouillage
-                        if reader.is_encrypted:
-                            try:
-                                if reader.decrypt("") or reader.decrypt(None):
-                                    logger.info("PDF was encrypted but unlocked with empty password.")
-                                else:
-                                    if not reader.decrypt(password):
-                                        error_count += 1
-                                        continue
-                            except:
-                                if not reader.decrypt(password):
-                                    error_count += 1
-                                    continue
-                        
-                        writer = PdfWriter()
-                        session = ensure_session_dict(user_id)
-                        username = session.get('username', '')
-                        
-                        for page in reader.pages:
-                            writer.add_page(page)
-                        
-                        with open(output_path, 'wb') as out:
-                            writer.write(out)
+                    with pikepdf.open(input_path, password=password if password.lower() != 'none' else '', allow_overwriting_input=True) as pdf:
+                        pdf.save(output_path)
                     
                     new_file_name = replace_username_in_filename(file_info['file_name'], username)
                     delay = session.get('delete_delay', AUTO_DELETE_DELAY)
@@ -2138,7 +2647,11 @@ async def process_batch_pages(client, message, user_id, pages_text):
         sessions[user_id]['processing'] = False
         return
     
-    logger.info(f"🔍 Début process_batch_pages - User {user_id} - Time: {datetime.now()}")
+    # Récupérer le username depuis la session
+    session = ensure_session_dict(user_id)
+    username = session.get('username', '')
+    
+    logger.info(f"🔍 Start process_batch_pages - User {user_id} - Time: {datetime.now()}")
     status = await create_or_edit_status(client, message, f"⏳ Processing {len(pdf_files)} PDF files...")
     success_count = 0
     error_count = 0
@@ -2155,26 +2668,18 @@ async def process_batch_pages(client, message, user_id, pages_text):
                     output_path = Path(temp_dir) / f"modified_{file_info['file_name']}"
                     shutil.move(file, input_path)
                     
-                    with open(input_path, 'rb') as f:
-                        reader = PdfReader(f)
-                        total_pages = len(reader.pages)
-                        
-                        writer = PdfWriter()
-                        session = ensure_session_dict(user_id)
-                        username = session.get('username', '')
-                        kept = 0
-                        
-                        for j in range(total_pages):
-                            if (j + 1) not in pages_to_remove:
-                                writer.add_page(reader.pages[j])
-                                kept += 1
-                        
-                        if kept == 0:
+                    with pikepdf.open(input_path, allow_overwriting_input=True) as pdf:
+                        pages_to_keep = [p for i, p in enumerate(pdf.pages) if (i + 1) not in pages_to_remove]
+
+                        if not pages_to_keep:
                             error_count += 1
                             continue
                         
-                        with open(output_path, 'wb') as out:
-                            writer.write(out)
+                        new_pdf = pikepdf.new()
+                        for page in pages_to_keep:
+                            new_pdf.pages.append(page)
+                            
+                        new_pdf.save(output_path)
                     
                     new_file_name = replace_username_in_filename(file_info['file_name'], username)
                     delay = session.get('delete_delay', AUTO_DELETE_DELAY)
@@ -2231,7 +2736,11 @@ async def process_batch_both(client, message, user_id, password, pages_text):
         sessions[user_id]['processing'] = False
         return
     
-    logger.info(f"🔍 Début process_batch_both - User {user_id} - Time: {datetime.now()}")
+    # Récupérer le username depuis la session
+    session = ensure_session_dict(user_id)
+    username = session.get('username', '')
+    
+    logger.info(f"🔍 Start process_batch_both - User {user_id} - Time: {datetime.now()}")
     status = await create_or_edit_status(client, message, f"⏳ Combined processing of {len(pdf_files)} PDF files...")
     success_count = 0
     error_count = 0
@@ -2248,30 +2757,21 @@ async def process_batch_both(client, message, user_id, password, pages_text):
                     output_path = Path(temp_dir) / f"both_{file_info['file_name']}"
                     shutil.move(file, input_path)
                     
-                    with open(input_path, 'rb') as f:
-                        reader = PdfReader(f)
-                        if reader.is_encrypted:
-                            if password.lower() != 'none' and not reader.decrypt(password):
-                                error_count += 1
-                                continue
+                    with pikepdf.open(input_path, password=password if password.lower() != 'none' else '', allow_overwriting_input=True) as pdf:
+                        total_pages = len(pdf.pages)
                         
-                        total_pages = len(reader.pages)
-                        writer = PdfWriter()
-                        session = ensure_session_dict(user_id)
-                        username = session.get('username', '')
-                        kept = 0
+                        pages_to_keep = [p for i, p in enumerate(pdf.pages) if (i + 1) not in pages_to_remove]
                         
-                        for j in range(total_pages):
-                            if (j + 1) not in pages_to_remove:
-                                writer.add_page(reader.pages[j])
-                                kept += 1
-                        
-                        if kept == 0:
+                        if not pages_to_keep:
                             error_count += 1
                             continue
                         
-                        with open(output_path, 'wb') as out:
-                            writer.write(out)
+                        # Create a new PDF with the remaining pages
+                        new_pdf = pikepdf.new()
+                        for page in pages_to_keep:
+                            new_pdf.pages.append(page)
+                        
+                        new_pdf.save(output_path)
                     
                     new_file_name = replace_username_in_filename(file_info['file_name'], username)
                     delay = session.get('delete_delay', AUTO_DELETE_DELAY)
@@ -2323,31 +2823,8 @@ async def process_unlock(client, message, session, password):
             output_path = Path(temp_dir) / f"unlocked_{session['file_name']}"
             shutil.move(file, input_path)
             
-            with open(input_path, 'rb') as f:
-                reader = PdfReader(f)
-                
-                # Vérifier si le PDF est protégé
-                if reader.is_encrypted:
-                    # Essayer de déverrouiller avec le mot de passe
-                    if password.lower() == 'none':
-                        # Essayer sans mot de passe
-                        if not reader.decrypt("") and not reader.decrypt(None):
-                            await status.edit_text("❌ PDF is protected. Please provide the correct password.")
-                            return
-                    else:
-                        # Essayer avec le mot de passe fourni
-                        if not reader.decrypt(password):
-                            await status.edit_text("❌ Incorrect password. Please try again.")
-                            return
-                
-                writer = PdfWriter()
-                
-                # Copier toutes les pages
-                for page in reader.pages:
-                    writer.add_page(page)
-                
-                with open(output_path, 'wb') as out:
-                    writer.write(out)
+            with pikepdf.open(input_path, password=password if password.lower() != 'none' else '', allow_overwriting_input=True) as pdf:
+                pdf.save(output_path)
             
             # Nettoyer le nom du fichier
             username = session.get('username', '')
@@ -2407,16 +2884,8 @@ async def process_clean_username(client, message_or_query, session):
                 output_path = Path(temp_dir) / f"cleaned_{file_name}"
                 shutil.move(file, input_path)
                 
-                with open(input_path, 'rb') as f:
-                    reader = PdfReader(f)
-                    writer = PdfWriter()
-                    
-                    # Copier toutes les pages sans modification
-                    for page in reader.pages:
-                        writer.add_page(page)
-                    
-                    with open(output_path, 'wb') as out:
-                        writer.write(out)
+                with pikepdf.open(input_path, allow_overwriting_input=True) as pdf:
+                    pdf.save(output_path)
                 
                 # Nettoyer le nom du fichier
                 username = session.get('username', '')
@@ -2509,13 +2978,8 @@ async def process_batch_clean(client, message, user_id):
                     input_path = Path(temp_dir) / "input.pdf"
                     output_path = Path(temp_dir) / f"cleaned_{file_name}"
                     shutil.move(file, input_path)
-                with open(input_path, 'rb') as f:
-                    reader = PdfReader(f)
-                    writer = PdfWriter()
-                    for page in reader.pages:
-                        writer.add_page(page)
-                    with open(output_path, 'wb') as out:
-                        writer.write(out)
+                    with pikepdf.open(input_path, allow_overwriting_input=True) as pdf:
+                        pdf.save(output_path)
                 username = sessions[user_id].get('username', '')
                 cleaned_name = replace_username_in_filename(file_name, username)
                 delay = sessions[user_id].get('delete_delay', AUTO_DELETE_DELAY)
@@ -2575,16 +3039,8 @@ async def process_pdf_batch_item(client, message, file_info, user_id):
                 output_path = Path(temp_dir) / f"cleaned_{file_name}"
                 shutil.copy2(local_path, input_path)
                 
-                with open(input_path, 'rb') as f:
-                    reader = PdfReader(f)
-                    writer = PdfWriter()
-                    
-                    # Copier toutes les pages sans modification
-                    for page in reader.pages:
-                        writer.add_page(page)
-                    
-                    with open(output_path, 'wb') as out:
-                        writer.write(out)
+                with pikepdf.open(input_path, allow_overwriting_input=True) as pdf:
+                    pdf.save(output_path)
                 
                 # Nettoyer le nom du fichier
                 username = sessions[user_id].get('username', '')
@@ -2771,44 +3227,32 @@ async def process_single_pdf(input_path, output_path, password=None, pages_to_re
     Retourne: (success, error_message)
     """
     try:
-        with open(input_path, 'rb') as f:
-            reader = PdfReader(f)
-            
-            # Déverrouillage si nécessaire
-            if reader.is_encrypted:
-                if not password or password.lower() == 'none':
-                    return False, "PDF is protected but no password provided"
-                if not reader.decrypt(password):
-                    return False, "Incorrect password"
-            
+        with pikepdf.open(input_path, password=password if password and password.lower() != 'none' else '', allow_overwriting_input=True) as pdf:
             # Suppression de pages si demandée
             if pages_to_remove:
-                total_pages = len(reader.pages)
+                total_pages = len(pdf.pages)
                 invalid_pages = [p for p in pages_to_remove if p < 1 or p > total_pages]
                 if invalid_pages:
                     return False, f"Invalid pages: {invalid_pages} (PDF has {total_pages} pages)"
                 
-                writer = PdfWriter()
-                kept = 0
-                for i in range(total_pages):
-                    if (i + 1) not in pages_to_remove:
-                        writer.add_page(reader.pages[i])
-                        kept += 1
+                pages_to_keep = [p for i, p in enumerate(pdf.pages) if (i + 1) not in pages_to_remove]
                 
-                if kept == 0:
+                if not pages_to_keep:
                     return False, "No pages remaining after removal"
+                
+                new_pdf = pikepdf.new()
+                for page in pages_to_keep:
+                    new_pdf.pages.append(page)
+                
+                new_pdf.save(output_path)
             else:
-                # Pas de suppression, copier toutes les pages
-                writer = PdfWriter()
-                for page in reader.pages:
-                    writer.add_page(page)
-            
-            # Écrire le PDF final
-            with open(output_path, 'wb') as out:
-                writer.write(out)
+                # Pas de suppression, sauvegarder directement
+                pdf.save(output_path)
             
             return True, None
             
+    except pikepdf.PasswordError:
+        return False, "Incorrect password"
     except Exception as e:
         return False, f"PDF processing error: {str(e)}"
 
@@ -3007,18 +3451,18 @@ async def handle_text_with_states(client, message: Message):
         return
     
     elif state == UserState.AWAITING_USERNAME:
-        # Gestion de l'ajout de username
+        # Gestion de l'ajout de hashtag/tag
         username = message.text.strip()
-        match = re.search(r'@[\w\d_]+', username)
-        if match:
-            username_clean = match.group()
-            if save_username(user_id, username_clean):
-                await client.send_message(message.chat.id, f"✅ Username saved: {username_clean}")
+        
+        # Accepter n'importe quel texte (hashtag, emoji, username, etc.)
+        if username:
+            if save_username(user_id, username):
+                await client.send_message(message.chat.id, f"✅ Tag saved: {username}")
             else:
-                await client.send_message(message.chat.id, f"✅ Username saved in session: {username_clean}\n⚠️ (Could not save to file)")
+                await client.send_message(message.chat.id, f"✅ Tag saved in session: {username}\n⚠️ (Could not save to file)")
             clear_user_state(user_id)
         else:
-            await client.send_message(message.chat.id, "❌ No valid @username found. Try again.")
+            await client.send_message(message.chat.id, "❌ Please send some text to use as your tag.")
     
     elif state == UserState.AWAITING_PASSWORD:
         # Gestion du mot de passe pour déverrouillage
@@ -3054,16 +3498,12 @@ async def handle_text_with_states(client, message: Message):
 # Utility function for deleting a page from a PDF by index
 async def delete_page_from_pdf(user_id, file_path, page_index, reply_context):
     try:
-        reader = PdfReader(file_path)
-        if page_index < 0 or page_index >= len(reader.pages):
-            await reply_context.reply_text("❌ Invalid page.")
-            return
-        writer = PdfWriter()
-        for i, page in enumerate(reader.pages):
-            if i != page_index:
-                writer.add_page(page)
-        with open(file_path, "wb") as f:
-            writer.write(f)
+        with pikepdf.open(file_path, allow_overwriting_input=True) as pdf:
+            if page_index < 0 or page_index >= len(pdf.pages):
+                await reply_context.reply_text("❌ Invalid page.")
+                return
+            pdf.pages.pop(page_index)
+            pdf.save(file_path)
         await reply_context.reply_document(document=file_path, caption=f"✅ Page {page_index + 1} deleted.")
     except Exception as e:
         logger.error(f"Error deleting page: {e}")
@@ -3072,9 +3512,10 @@ async def delete_page_from_pdf(user_id, file_path, page_index, reply_context):
 # ✅ 4. Fonction is_pdf_locked(file_path)
 def is_pdf_locked(file_path: str) -> bool:
     try:
-        with open(file_path, "rb") as f:
-            reader = PdfReader(f)
-            return reader.is_encrypted
+        with pikepdf.open(file_path) as pdf:
+            return False  # Si on peut l'ouvrir sans mot de passe, il n'est pas verrouillé
+    except pikepdf.PasswordError:
+        return True  # Verrouillé
     except Exception as e:
         logger.error(f"Error is_pdf_locked: {e}")
         return True
@@ -3082,8 +3523,8 @@ def is_pdf_locked(file_path: str) -> bool:
 # ✅ 5. Fonction get_last_page_number(file_path)
 def get_last_page_number(file_path: str) -> int:
     try:
-        reader = PdfReader(file_path)
-        return len(reader.pages) - 1
+        with pikepdf.open(file_path, allow_overwriting_input=True) as pdf:
+            return len(pdf.pages) - 1
     except Exception as e:
         logger.error(f"Error getting last page: {e}")
         return 0
@@ -3135,31 +3576,25 @@ async def process_pages(client, message, session, pages_text):
             output_path = Path(temp_dir) / f"pages_{session['file_name']}"
             shutil.move(file, input_path)
             
-            with open(input_path, 'rb') as f:
-                reader = PdfReader(f)
-                
-                # Vérifier si le PDF est protégé
-                if reader.is_encrypted:
-                    await status.edit_text("❌ PDF is protected. Please use 'Unlock' first or provide a password.")
-                    return
-                
-                total_pages = len(reader.pages)
-                writer = PdfWriter()
-                username = session.get('username', '')
-                kept = 0
-                
-                # Supprimer les pages spécifiées
-                for j in range(total_pages):
-                    if (j + 1) not in pages_to_remove:
-                        writer.add_page(reader.pages[j])
-                        kept += 1
-                
-                if kept == 0:
-                    await status.edit_text("❌ No pages remaining after removal.")
-                    return
-                
-                with open(output_path, 'wb') as out:
-                    writer.write(out)
+            try:
+                with pikepdf.open(input_path, allow_overwriting_input=True) as pdf:
+                    total_pages = len(pdf.pages)
+                    username = session.get('username', '')
+                    
+                    pages_to_keep = [p for i, p in enumerate(pdf.pages) if (i + 1) not in pages_to_remove]
+                    
+                    if not pages_to_keep:
+                        await status.edit_text("❌ No pages remaining after removal.")
+                        return
+                    
+                    new_pdf = pikepdf.new()
+                    for page in pages_to_keep:
+                        new_pdf.pages.append(page)
+                    
+                    new_pdf.save(output_path)
+            except pikepdf.PasswordError:
+                await status.edit_text("❌ PDF is protected. Please use 'Unlock' first or provide a password.")
+                return
             
             # Nettoyer le nom du fichier
             cleaned_name = replace_username_in_filename(session['file_name'], username)
@@ -3213,32 +3648,25 @@ async def process_pages_with_password(client, message, session, password, pages_
             output_path = Path(temp_dir) / f"pages_{session['file_name']}"
             shutil.move(file, input_path)
             
-            with open(input_path, 'rb') as f:
-                reader = PdfReader(f)
-                
-                # Déverrouiller si nécessaire
-                if reader.is_encrypted:
-                    if password.lower() != 'none' and not reader.decrypt(password):
-                        await status.edit_text("❌ Incorrect password.")
+            try:
+                with pikepdf.open(input_path, password=password if password.lower() != 'none' else '', allow_overwriting_input=True) as pdf:
+                    total_pages = len(pdf.pages)
+                    username = session.get('username', '')
+                    
+                    pages_to_keep = [p for i, p in enumerate(pdf.pages) if (i + 1) not in pages_to_remove]
+                    
+                    if not pages_to_keep:
+                        await status.edit_text("❌ No pages remaining after removal.")
                         return
-                
-                total_pages = len(reader.pages)
-                writer = PdfWriter()
-                username = session.get('username', '')
-                kept = 0
-                
-                # Supprimer les pages spécifiées
-                for j in range(total_pages):
-                    if (j + 1) not in pages_to_remove:
-                        writer.add_page(reader.pages[j])
-                        kept += 1
-                
-                if kept == 0:
-                    await status.edit_text("❌ No pages remaining after removal.")
-                    return
-                
-                with open(output_path, 'wb') as out:
-                    writer.write(out)
+                    
+                    new_pdf = pikepdf.new()
+                    for page in pages_to_keep:
+                        new_pdf.pages.append(page)
+                    
+                    new_pdf.save(output_path)
+            except pikepdf.PasswordError:
+                await status.edit_text("❌ Incorrect password.")
+                return
             
             # Nettoyer le nom du fichier
             cleaned_name = replace_username_in_filename(session['file_name'], username)
@@ -3297,29 +3725,461 @@ async def process_both(client, message, session, text):
         # IMPORTANT: Supprimer complètement la session
         sessions.pop(user_id, None)
 
-# Lancement du bot
+# ===== Commands: setbanner / view_banner / setpassword / reset_password / setextra_pages =====
+@app.on_message(filters.command(["setbanner"]) & filters.private)
+async def cmd_setbanner(client, message: Message):
+    uid = message.from_user.id
+    # Force-join check
+    if not await is_user_in_channel(uid):
+        await send_force_join_message(client, message)
+        return
+    sessions.setdefault(uid, {})["awaiting_banner_upload"] = True
+    await client.send_message(message.chat.id, "🖼️ Send me your banner (image or 1-page PDF).")
+
+
+@app.on_message(filters.command(["view_banner", "viewbanner"]) & filters.private)
+async def cmd_view_banner(client, message: Message):
+    uid = message.from_user.id
+    # Force-join check
+    if not await is_user_in_channel(uid):
+        await send_force_join_message(client, message)
+        return
+    bp = get_user_pdf_settings(uid).get("banner_path")
+    if not bp or not os.path.exists(bp):
+        await client.send_message(message.chat.id, "ℹ️ No banner set. Use /setbanner")
+        return
+    if bp.lower().endswith(".pdf"):
+        await client.send_document(message.chat.id, bp, caption="📄 Banner (PDF)")
+    else:
+        await client.send_photo(message.chat.id, bp, caption="🖼️ Banner (image)")
+
+
+@app.on_message(filters.command(["setpassword"]) & filters.private)
+async def cmd_setpassword(client, message: Message):
+    uid = message.from_user.id
+    # Force-join check
+    if not await is_user_in_channel(uid):
+        await send_force_join_message(client, message)
+        return
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        # Interactive mode: ask for password now
+        sessions.setdefault(uid, {})["awaiting_new_password"] = True
+        await client.send_message(
+            message.chat.id,
+            "🔐 Send your default password now (or type 'none' to disable)."
+        )
+        return
+    arg = parts[1].strip()
+    if arg.lower() in ("none", "off", "disable"):
+        update_user_pdf_settings(uid, lock_password=None)
+        await client.send_message(message.chat.id, "🔓 Default password removed.")
+    else:
+        update_user_pdf_settings(uid, lock_password=arg)
+        await client.send_message(message.chat.id, "🔐 Default password saved.")
+
+
+@app.on_message(filters.command(["reset_password"]) & filters.private)
+async def cmd_reset_password(client, message: Message):
+    uid = message.from_user.id
+    # Force-join check
+    if not await is_user_in_channel(uid):
+        await send_force_join_message(client, message)
+        return
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) >= 2:
+        update_user_pdf_settings(uid, lock_password=parts[1].strip())
+        await client.send_message(message.chat.id, "🔐 New default password saved.")
+        return
+    sessions.setdefault(uid, {})["awaiting_new_password"] = True
+    await client.send_message(message.chat.id, "🔐 Send the new default password now.")
+
+
+@app.on_message(filters.command(["setextra_pages"]) & filters.private)
+async def cmd_setextra_pages(client, message: Message):
+    uid = message.from_user.id
+    # Force-join check
+    if not await is_user_in_channel(uid):
+        await send_force_join_message(client, message)
+        return
+    session = sessions.get(uid, {})
+    if not session.get("file_id"):
+        await client.send_message(message.chat.id, "📄 Send a PDF first.")
+        return
+    sessions.setdefault(uid, {})["awaiting_extract_page"] = True
+    await client.send_message(message.chat.id, "📄 Which page number should I extract as image? (e.g., 1)")
+
+
+# Extend existing text handler with awaited states (password + page number + extract + new password)
+@app.on_message(filters.text & filters.private)
+async def on_text_extensions(client, message: Message):
+    uid = message.from_user.id
+    chat_id = message.chat.id
+    # Force-join check
+    if not await is_user_in_channel(uid):
+        await send_force_join_message(client, message)
+        return
+    sess = sessions.setdefault(uid, {})
+
+    if sess.get("awaiting_new_password"):
+        pw = message.text.strip()
+        sess["awaiting_new_password"] = False
+        if pw.lower() in {"none", "off", "disable"}:
+            update_user_pdf_settings(uid, lock_password=None)
+            await client.send_message(chat_id, "🔓 Default password removed.")
+        else:
+            update_user_pdf_settings(uid, lock_password=pw)
+            await client.send_message(chat_id, "✅ Default password updated.")
+        return
+
+    if sess.get("awaiting_extract_page"):
+        try:
+            page_no = int(message.text.strip())
+        except Exception:
+            await client.send_message(chat_id, "❌ Send a valid page number (e.g., 1)")
+            return
+        sess["awaiting_extract_page"] = False
+        # download current pdf and send the page as image
+        file_id = sess.get("file_id")
+        file_name = sess.get("file_name") or "document.pdf"
+        user_dir = get_user_temp_dir(uid)
+        in_path = await client.download_media(file_id, file_name=user_dir / "extract_input.pdf")
+        # If PDF is locked, ask to unlock first
+        if is_pdf_locked(in_path):
+            await client.send_message(chat_id, "❌ The PDF is locked. Please unlock it first, then try again.")
+            return
+        out_img = str(user_dir / f"{Path(file_name).stem}_page{page_no}.png")
+        try:
+            extract_page_to_png(in_path, page_no, out_img, zoom=2.0)
+            await client.send_photo(chat_id, out_img, caption=f"🖼️ Page {page_no}")
+        except Exception as e:
+            await client.send_message(chat_id, f"❌ Cannot extract page {page_no}: {e}")
+        return
+
+
+# Capture of banner upload (photo or document)
+@app.on_message(filters.photo & filters.private)
+async def on_photo_maybe_banner(client, message: Message):
+    uid = message.from_user.id
+    # Force-join check
+    if not await is_user_in_channel(uid):
+        await send_force_join_message(client, message)
+        return
+    if sessions.get(uid, {}).get("awaiting_banner_upload"):
+        path = await client.download_media(message.photo.file_id, file_name=BANNERS_DIR / f"banner_{uid}.jpg")
+        update_user_pdf_settings(uid, banner_path=str(path))
+        sessions[uid]["awaiting_banner_upload"] = False
+        await client.send_message(message.chat.id, "✅ Banner image saved.")
+
+
+# Hook inside existing document handler flow to accept banner file uploads
+@app.on_message(filters.document & filters.private)
+async def on_document_maybe_banner_or_pdf_forward(client, message: Message):
+    uid = message.from_user.id
+    # Force-join check
+    if not await is_user_in_channel(uid):
+        await send_force_join_message(client, message)
+        return
+    if sessions.get(uid, {}).get("awaiting_banner_upload"):
+        doc = message.document
+        name = (doc.file_name or "banner")
+        if (doc.mime_type or "").startswith("image/") or name.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif")):
+            path = await client.download_media(doc.file_id, file_name=BANNERS_DIR / f"banner_{uid}{Path(name).suffix}")
+            update_user_pdf_settings(uid, banner_path=str(path))
+            sessions[uid]["awaiting_banner_upload"] = False
+            await client.send_message(message.chat.id, "✅ Banner image saved.")
+            return
+        elif name.lower().endswith(".pdf"):
+            path = await client.download_media(doc.file_id, file_name=BANNERS_DIR / f"banner_{uid}.pdf")
+            update_user_pdf_settings(uid, banner_path=str(path))
+            sessions[uid]["awaiting_banner_upload"] = False
+            await client.send_message(message.chat.id, "✅ Banner PDF saved.")
+            return
+    # If not awaiting banner, fall through to original document flow handled elsewhere
+
+
+# ===== Inline buttons additions: Add banner + Lock =====
+
+def build_pdf_actions_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧹 Clean usernames", callback_data=f"clean_username:{user_id}")],
+        [InlineKeyboardButton("🔓 Unlock", callback_data=f"unlock:{user_id}")],
+        [InlineKeyboardButton("🗑️ Remove pages", callback_data=f"pages:{user_id}")],
+        [InlineKeyboardButton("🛠️ The Both", callback_data=f"both:{user_id}")],
+        [InlineKeyboardButton("🪧 Add banner", callback_data=f"add_banner:{user_id}")],
+        [InlineKeyboardButton("🔐 Lock", callback_data=f"lock_now:{user_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")],
+    ])
+
+
+@app.on_callback_query(filters.regex(r"^add_banner:(\d+)$"))
+async def cb_add_banner(client, query: CallbackQuery):
+    # Neutralized: handled in the generic button_callback
+    await query.answer()
+    return
+ 
+ 
+@app.on_callback_query(filters.regex(r"^lock_now:(\d+)$"))
+async def cb_lock_now(client, query: CallbackQuery):
+    # Neutralized: handled in the generic button_callback
+    await query.answer()
+    return
+
+
+# ===== /pdf_edit macro command =====
+@app.on_message(filters.command(["addfsub"]) & filters.private)
+@admin_only
+async def addfsub_handler(client, message: Message):
+    track_user(message.from_user.id)
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.reply_text("Usage:\n`/addfsub @channel1 @channel2 ...`", quote=True)
+        return
+    raw = re.split(r"[,\s]+", args[1].strip())
+    chans = [x for x in (s.lstrip("@").lstrip("#") for s in raw) if x]
+    new_list = add_forced_channels(chans)
+    await message.reply_text("✅ Forced-sub channels updated:\n" + "\n".join(f"• @{c}" for c in new_list), quote=True)
+
+@app.on_message(filters.command(["delfsub"]) & filters.private)
+@admin_only
+async def delfsub_handler(client, message: Message):
+    track_user(message.from_user.id)
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        set_forced_channels([])
+        await message.reply_text("✅ All forced-sub channels removed.", quote=True)
+        return
+    raw = re.split(r"[,\s]+", args[1].strip())
+    chans = [x for x in (s.lstrip("@").lstrip("#") for s in raw) if x]
+    new_list = del_forced_channels(chans)
+    if new_list:
+        await message.reply_text("✅ Remaining forced-sub channels:\n" + "\n".join(f"• @{c}" for c in new_list), quote=True)
+    else:
+        await message.reply_text("✅ No forced-sub channels configured.", quote=True)
+
+@app.on_message(filters.command(["channels"]) & filters.private)
+@admin_only
+async def channels_handler(client, message: Message):
+    track_user(message.from_user.id)
+    chans = get_forced_channels()
+    if not chans:
+        await message.reply_text("ℹ️ No forced-sub channels configured.", quote=True)
+        return
+    await message.reply_text("📋 Forced-sub channels:\n" + "\n".join(f"• @{c}" for c in chans), quote=True)
+
+@app.on_message(filters.command(["status"]) & filters.private)
+async def status_handler(client, message: Message):
+    track_user(message.from_user.id)
+    t0 = time.time()
+    ping_msg = await message.reply_text("[/status\n\nCalculating ping...]", quote=True)
+    ping_ms = (time.time() - t0) * 1000.0
+
+    uptime = fmt_uptime(time.time() - START_TIME)
+    users = total_users()
+
+    ram_pct = cpu_pct = None
+    if psutil:
+        try:
+            ram_pct = psutil.virtual_memory().percent
+            cpu_pct = psutil.cpu_percent(interval=0.2)
+        except Exception:
+            pass
+
+    du = shutil.disk_usage(Path.cwd())
+    disk_used = du.used
+    disk_total = du.total
+    disk_free = du.free
+    disk_pct = (disk_used / disk_total) * 100 if disk_total else 0
+
+    stats = get_stats()
+    total_files = stats.get("files", 0)
+    total_storage = stats.get("storage_bytes", 0)
+
+    def bar(pct: float) -> str:
+        pct = 0.0 if pct is None else max(0.0, min(100.0, pct))
+        filled = int(round(pct / 10))
+        slots = 10
+        blocks = "■" * max(0, filled - 1)
+        tip = "▤" if filled > 0 else ""
+        empty = "□" * (slots - filled)
+        return f"[{blocks}{tip}{empty}] {pct:.1f}%"
+
+    ram_line = f"┖ {bar(ram_pct)}" if ram_pct is not None else "┖ N/A"
+    cpu_line = f"┖ {bar(cpu_pct)}" if cpu_pct is not None else "┖ N/A"
+
+    text = (
+        "Bot Status\n\n"
+        f"Uptime: {uptime}\n"
+        f"Ping: {ping_ms:.0f} ms\n"
+        f"Users: {users}\n\n"
+        "RAM:\n"
+        f"{ram_line}\n\n"
+        "CPU:\n"
+        f"{cpu_line}\n\n"
+        "Disk:\n"
+        f"{bar(disk_pct)}\n"
+        f"Used: {format_bytes(disk_used)}\n"
+        f"Free: {format_bytes(disk_free)}\n"
+        f"Total: {format_bytes(disk_total)}\n\n"
+        "Rename Statistics:\n"
+        f"Total files renamed: {total_files:,}\n"
+        f"Total storage used: {format_bytes(total_storage)}"
+    )
+
+    try:
+        await ping_msg.edit_text(text)
+    except Exception:
+        await message.reply_text(text, quote=True)
+@app.on_message(filters.command(["pdf_edit"]) & filters.private)
+async def cmd_pdf_edit(client, message: Message):
+    uid = message.from_user.id
+    # Force-join check
+    if not await is_user_in_channel(uid):
+        await send_force_join_message(client, message)
+        return
+    sess = sessions.setdefault(uid, {})
+    file_id = sess.get("file_id")
+    file_name = sess.get("file_name") or "document.pdf"
+    chat_id = message.chat.id
+    if not file_id:
+        await client.send_message(chat_id, "📄 Send a PDF first.")
+        return
+    user_dir = get_user_temp_dir(uid)
+    in_path = await client.download_media(file_id, file_name=user_dir / "pdfedit_input.pdf")
+    try:
+        with pikepdf.open(in_path):
+            pass
+        sess["pdf_edit"] = {"work": in_path}
+        sess["awaiting_pdf_edit_pages"] = True
+        await client.send_message(chat_id, "🧹 Pages to remove? e.g. 1,3,5-7 — send `none` to skip.")
+    except PasswordError:
+        sess["pdf_edit"] = {"work": in_path}
+        sess["awaiting_pdf_edit_password"] = True
+        await client.send_message(chat_id, "🔑 PDF is locked. Send password to unlock.")
+
+
+@app.on_message(filters.text & filters.private)
+async def on_text_pdf_edit_flow(client, message: Message):
+    uid = message.from_user.id
+    chat_id = message.chat.id
+    # Force-join check
+    if not await is_user_in_channel(uid):
+        await send_force_join_message(client, message)
+        return
+    sess = sessions.setdefault(uid, {})
+
+    if sess.get("awaiting_pdf_edit_password") and not sess.get("awaiting_new_password"):
+        pw = message.text.strip()
+        sess["awaiting_pdf_edit_password"] = False
+        if not pw:
+            await client.send_message(chat_id, "❌ Empty password. Retry /pdf_edit.")
+            sess.pop("pdf_edit", None)
+            return
+        tmp_in = sess["pdf_edit"]["work"]
+        user_dir = get_user_temp_dir(uid)
+        unlocked = str(user_dir / "pdfedit_unlocked.pdf")
+        try:
+            unlock_pdf(tmp_in, unlocked, pw)
+        except PasswordError:
+            sess["awaiting_pdf_edit_password"] = True
+            await client.send_message(chat_id, "❌ Wrong password. Try again.")
+            return
+        sess["pdf_edit"]["work"] = unlocked
+        sess["awaiting_pdf_edit_pages"] = True
+        await client.send_message(chat_id, "🧹 Pages to remove? e.g. 1,3,5-7 — send `none` to skip.")
+        return
+
+    if sess.get("awaiting_pdf_edit_pages"):
+        sess["awaiting_pdf_edit_pages"] = False
+        pages = parse_pages_spec(message.text)
+        user_dir = get_user_temp_dir(uid)
+        cur = sess["pdf_edit"]["work"]
+        pruned = str(user_dir / "pdfedit_pruned.pdf")
+        try:
+            remove_pages_by_numbers(cur, pruned, pages)
+        except Exception as e:
+            await client.send_message(chat_id, f"❌ Error removing pages: {e}")
+            sess.pop("pdf_edit", None)
+            return
+        banner_pdf = _ensure_banner_pdf_path(uid)
+        after_banner = pruned
+        if banner_pdf:
+            after_banner = str(user_dir / "pdfedit_bannered.pdf")
+            try:
+                add_banner_pages_to_pdf(pruned, after_banner, banner_pdf, place="before")
+            except Exception as e:
+                await client.send_message(chat_id, f"❌ Error adding banner: {e}")
+                sess.pop("pdf_edit", None)
+                return
+        default_pw = get_user_pdf_settings(uid).get("lock_password")
+        if not default_pw:
+            sess["pdf_edit"]["work"] = after_banner
+            sess["awaiting_pdf_edit_lock_password"] = True
+            await client.send_message(chat_id, "🔐 Send password to lock PDF (or `skip` to send without lock).")
+            return
+        await _pdf_edit_finalize_and_send(client, uid, chat_id, after_banner, default_pw)
+        return
+
+    if sess.get("awaiting_pdf_edit_lock_password"):
+        sess["awaiting_pdf_edit_lock_password"] = False
+        lock_pw = message.text.strip()
+        work = sess.get("pdf_edit", {}).get("work")
+        if not work:
+            await client.send_message(chat_id, "⚠️ Context lost. Run /pdf_edit again.")
+            return
+        if lock_pw.lower() in {"skip", "none", "no"}:
+            await _pdf_edit_finalize_and_send(client, uid, chat_id, work, None)
+            return
+        await _pdf_edit_finalize_and_send(client, uid, chat_id, work, lock_pw)
+        return
+
+
+async def _pdf_edit_finalize_and_send(client, uid: int, chat_id: int, input_path: str, lock_pw: str | None):
+    user_dir = get_user_temp_dir(uid)
+    out_path = input_path
+    if lock_pw:
+        locked = str(user_dir / "pdfedit_locked.pdf")
+        try:
+            lock_pdf_with_password(input_path, locked, lock_pw)
+            out_path = locked
+        except Exception as e:
+            await client.send_message(chat_id, f"❌ Error locking PDF: {e}")
+            sessions.get(uid, {}).pop("pdf_edit", None)
+            return
+    file_name = sessions.get(uid, {}).get("file_name") or "document.pdf"
+    delay = sessions.get(uid, {}).get('delete_delay', AUTO_DELETE_DELAY)
+    final_name = replace_username_in_filename(Path(file_name).name, sessions.get(uid, {}).get('username'))
+    await send_and_delete(client, chat_id, out_path, final_name, delay_seconds=delay)
+    sessions.get(uid, {}).pop("pdf_edit", None)
+
+@app.on_startup
+async def startup_message():
+    """Send startup message with bot status"""
+    try:
+        # Get forced channels
+        channels = get_forced_channels()
+        force_join_text = f"@{' @'.join(channels)}" if channels else "DISABLED"
+        
+        # Get daily limit from config
+        daily_limit_gb = 2.0  # You can make this configurable
+        cooldown_seconds = 30  # You can make this configurable
+        
+        startup_msg = (
+            "🟢 **Bot started!**\n\n"
+            "PDF bot is now online and ready.\n\n"
+            f"📈 Daily limit: {daily_limit_gb} GB\n"
+            f"⏱️ Cooldown: {cooldown_seconds}s\n"
+            "⚡️ Fast mode: ENABLED\n"
+            f"📢 Force Join: {force_join_text}"
+        )
+        
+        # Send to console/log
+        print(startup_msg)
+        logger.info("PDF Bot started successfully!")
+        
+    except Exception as e:
+        logger.error(f"Error in startup message: {e}")
+
+# Entry point
 if __name__ == "__main__":
-    print("🚀 Starting PDF Bot (Pyrogram) - ENGLISH VERSION WITH FORCE JOIN - CORRECTED")
-    print(f"🆔 Process PID: {os.getpid()}")
-    print(f"⏰ Start time: {datetime.now()}")
-    print("✅ Bot configured and ready!")
-    print(f"📢 Force Join Channel: @{FORCE_JOIN_CHANNEL}")
-    print("\n📌 Features:")
-    print("  ✅ Force join channel protection")
-    print("  ✅ All messages in English")
-    print("  ✅ Anti-duplicate global protection")
-    print("  ✅ Rate limiting (5 actions per minute)")
-    print("  ✅ Success messages before file sending")
-    print("  ✅ Session deletion after processing")
-    print("  ✅ Clean button cleans AND adds username")
-    print("  ✅ Automatic session cleanup (10 min timeout)")
-    print("  ✅ Fixed batch mode with proper cleanup")
-    print("  ✅ Fixed button handlers (First/Last/Middle)")
-    print("  ✅ Improved error handling for corrupted PDFs")
-    print("  ✅ Fixed delay=0 handling")
-    print("  ✅ Better password detection")
-    print("  ✅ Full video support with rename and clean")
-    print("  ✅ Video batch processing")
-    print("\n🔧 All bugs fixed and tested!")
-    
     app.run()
