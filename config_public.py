@@ -1,10 +1,5 @@
-# Configuration du bot Telegram PDF - EXEMPLE
-# Copie ce fichier vers config.py et remplace les valeurs par tes propres clés API
-
-# Clés Telegram (obtenues sur https://my.telegram.org)
-API_ID = 12345678  # Remplace par ton API_ID
-API_HASH = "abcdef1234567890abcdef1234567890"  # Remplace par ton API_HASH
-BOT_TOKEN = "7638360605:AAHEapDiCSvX-nSwaoKlQxgf0vEujrgAIwY"  # Remplace par ton BOT_TOKEN
+# Configuration publique du bot Telegram PDF
+# Ce fichier peut être partagé sur GitHub (sans clés privées)
 
 # Configuration du bot
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
@@ -18,4 +13,12 @@ MESSAGES = {
     'success_unlock': "✅ PDF déverrouillé avec succès !",
     'success_pages': "✅ Pages supprimées avec succès !",
     'error': "❌ Erreur lors du traitement"
-} 
+}
+
+# Instructions pour configurer le bot :
+# 1. Copier ce fichier vers config.py
+# 2. Ajouter vos clés API privées :
+#    API_ID = votre_api_id
+#    API_HASH = "votre_api_hash"
+#    BOT_TOKEN = "votre_bot_token"
+#    ADMIN_IDS = "votre_admin_ids"
