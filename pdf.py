@@ -1787,8 +1787,8 @@ async def button_callback(client, query: CallbackQuery):
                     "• 1-5 → removes pages 1 to 5"
                 )
             else:
-                        logger.error(f"❌ batch_both_manual - No password found for user {user_id}")
-        await query.answer("❌ Password not found. Please restart with /process", show_alert=True)
+                logger.error(f"❌ batch_both_manual - No password found for user {user_id}")
+                await query.answer("❌ Password not found. Please restart with /process", show_alert=True)
         await safe_edit_message(query, "❌ Error: missing password.\n\nPlease use `/process` to process again.")
         return
     
