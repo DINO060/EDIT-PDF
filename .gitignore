@@ -1,6 +1,7 @@
 # Ignorer fichiers de config et de session
 config.py
 usernames.json
+pdf_settings.json
 *.session
 
 # Dossiers temporaires
