@@ -8,7 +8,7 @@ BOT_TOKEN = "8172549450:AAGs8OlyIe5j7SF_Xm5k_eHnEj5PWKz_-SY"  # Remplace par ton
 ADMIN_IDS = "7570539064,7615697178"  # IDs des admins sous forme de chaîne, séparés par des virgules
 
 # Configuration du bot
-MAX_FILE_SIZE = 1024 * 1024 * 1024  # 1 GB
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
 
 # Messages du bot
 MESSAGES = {
