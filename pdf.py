@@ -897,6 +897,12 @@ async def start_handler(client, message: Message):
         asyncio.create_task(cleanup_temp_files())
         cleanup_task_started = True
         logger.info("Periodic cleanup task started")
+        
+        # Send startup message to all users on first /start
+        try:
+            await startup_message()
+        except Exception as e:
+            logger.error(f"Error sending startup message: {e}")
     
     # NEW: Load saved username
     saved_username = get_saved_username(user_id)
@@ -4152,9 +4158,8 @@ async def _pdf_edit_finalize_and_send(client, uid: int, chat_id: int, input_path
     await send_and_delete(client, chat_id, out_path, final_name, delay_seconds=delay)
     sessions.get(uid, {}).pop("pdf_edit", None)
 
-@app.on_startup
 async def startup_message():
-    """Send startup message with bot status"""
+    """Send startup message with bot status to all users"""
     try:
         # Get forced channels
         channels = get_forced_channels()
@@ -4177,9 +4182,58 @@ async def startup_message():
         print(startup_msg)
         logger.info("PDF Bot started successfully!")
         
+        # Get all users from database
+        all_users = []
+        try:
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.execute("SELECT id FROM users")
+                all_users = [row[0] for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting users from DB: {e}")
+            # Fallback to JSON file if DB fails
+            try:
+                data = _load_json(USERS_FILE, {"users": []})
+                all_users = [int(u) for u in data.get("users", []) if str(u).strip()]
+            except Exception as e2:
+                logger.error(f"Error getting users from JSON: {e2}")
+        
+        # Add admin IDs if configured
+        if ADMIN_IDS:
+            admin_list = [int(x) for x in str(ADMIN_IDS).split(',') if x.strip()]
+            for admin_id in admin_list:
+                if admin_id not in all_users:
+                    all_users.append(admin_id)
+        
+        # Remove duplicates
+        all_users = list(set(all_users))
+        
+        # Send startup message to all users
+        success_count = 0
+        for user_id in all_users:
+            try:
+                await app.send_message(
+                    user_id, 
+                    startup_msg
+                )
+                success_count += 1
+                # Small delay to avoid flood
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                logger.error(f"Failed to send startup message to user {user_id}: {e}")
+                continue
+        
+        print(f"📢 Startup message sent to {success_count}/{len(all_users)} users")
+        
     except Exception as e:
         logger.error(f"Error in startup message: {e}")
 
+# Add startup handler
+@app.on_message(filters.command("startup") & filters.user(ADMIN_IDS.split(',') if ADMIN_IDS else []))
+async def manual_startup(client, message):
+    """Manual startup message trigger for admins"""
+    await startup_message()
+
 # Entry point
 if __name__ == "__main__":
+    # Start the bot and run startup message
     app.run()

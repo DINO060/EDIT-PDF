@@ -3,8 +3,8 @@
 
 # Clés Telegram (obtenues sur https://my.telegram.org)
 API_ID = 12345678  # Remplace par ton API_ID
-API_HASH = "YOUR_API_HASH_HERE"  # Remplace par ton API_HASH
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Remplace par ton BOT_TOKEN
+API_HASH = "abcdef1234567890abcdef1234567890"  # Remplace par ton API_HASH
+BOT_TOKEN = ""  # Remplace par ton BOT_TOKEN
 
 # Configuration du bot
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
