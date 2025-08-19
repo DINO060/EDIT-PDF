@@ -4,6 +4,9 @@ usernames.json
 pdf_settings.json
 force_join_channels.json
 *.session
+bot_data.sqlite3
+bot_data.sqlite3-*
+*.sqlite3
 
 # Dossiers temporaires
 __pycache__/
