@@ -1092,8 +1092,14 @@ def build_pdf_actions_keyboard(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🛠️ The Both", callback_data=f"both:{user_id}")],
         [InlineKeyboardButton("🪧 Add banner", callback_data=f"add_banner:{user_id}")],
         [InlineKeyboardButton("🔐 Lock", callback_data=f"lock_now:{user_id}")],
-        [InlineKeyboardButton("📍 Change Position", callback_data=f"change_position:{user_id}")],
         [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")],
+    ])
+
+def build_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Settings/parameters menu for per-user options."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📍 Change Position", callback_data=f"change_position:{user_id}")],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"back_settings:{user_id}")],
     ])
 
 @app.on_callback_query(filters.regex(r"^change_position:(\d+)$"))
@@ -1117,6 +1123,19 @@ async def cb_change_position(client, query: CallbackQuery):
         )
     except Exception as e:
         logger.error(f"cb_change_position error: {e}")
+
+@app.on_callback_query(filters.regex(r"^settings$"))
+async def cb_settings(client, query: CallbackQuery):
+    """Open the Settings/Parameters menu from the global Settings button."""
+    try:
+        user_id = query.from_user.id
+        kb = build_settings_keyboard(user_id)
+        await query.message.edit_text(
+            "⚙️ Settings\n\nChoose what to configure:",
+            reply_markup=kb
+        )
+    except Exception as e:
+        logger.error(f"cb_settings error: {e}")
 
 @app.on_callback_query(filters.regex(r"^set_position_(start|end):(\d+)$"))
 async def cb_set_position(client, query: CallbackQuery):
