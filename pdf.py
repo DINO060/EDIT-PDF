@@ -42,12 +42,23 @@ API_HASH = get_env_or_config("API_HASH")
 BOT_TOKEN = get_env_or_config("BOT_TOKEN")
 ADMIN_IDS = get_env_or_config("ADMIN_IDS", "")
 
-
 # File to store usernames persistently
 USERNAMES_FILE = Path("usernames.json")
 
 # Default username to add at the end of captions
 DEFAULT_USERNAME_TAG = "@PdfBot"  # Change according to your bot
+
+# --- Text position preference helpers ---
+def get_text_position(user_id: int) -> str:
+    """Return user's preferred text position in filename: 'start' or 'end' (default)."""
+    return sessions.get(user_id, {}).get('text_position', 'end')
+
+def set_text_position(user_id: int, position: str) -> None:
+    """Set user's preferred text position in filename."""
+    if position not in ('start', 'end'):
+        position = 'end'
+    sess = sessions.setdefault(user_id, {})
+    sess['text_position'] = position
 
 def is_supported_video(filename):
     """Detects if the file is a supported video"""
@@ -730,31 +741,11 @@ def extract_and_clean_pdf_text(page):
         text = page.extract_text()
         if text:
             return clean_text(text)
-        return ""
     except Exception as e:
         logger.warning(f"Error extracting text: {e}")
-        return ""
+    return ""
 
-def replace_username_in_filename(filename, new_username=None):
-    """
-    Nettoie et modifie automatiquement le nom du fichier pour inclure le hashtag/username à la fin.
-    Supprime les blocs avec @ ou #, les emojis, et ajoute le tag personnalisé.
-    """
-    base, ext = os.path.splitext(filename)
-    
-    # Utilise la nouvelle fonction de nettoyage
-    base = clean_filename(base)
-    
-    # Ajoute le tag personnalisé (username, hashtag, emoji, etc.)
-    if new_username:
-        base = f"{base} {new_username}".strip()
-    
-    return f"{base}{ext}"
-
-async def create_or_edit_status(client, message, text):
-    """Crée ou édite un message de statut selon le contexte"""
-    try:
-        # Si c'est un CallbackQuery, on peut éditer
+# ... (rest of the code remains the same)
         if hasattr(message, 'edit_message_text'):
             return await message.edit_message_text(text)
         # Sinon, on crée un nouveau message
@@ -1093,6 +1084,7 @@ async def process_batch_command(client, message: Message):
     sessions[user_id]['process_command_processing'] = False
 
 def build_pdf_actions_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    # Include a button to change text position preference
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🧹 Clean usernames", callback_data=f"clean_username:{user_id}")],
         [InlineKeyboardButton("🔓 Unlock", callback_data=f"unlock:{user_id}")],
@@ -1100,8 +1092,53 @@ def build_pdf_actions_keyboard(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🛠️ The Both", callback_data=f"both:{user_id}")],
         [InlineKeyboardButton("🪧 Add banner", callback_data=f"add_banner:{user_id}")],
         [InlineKeyboardButton("🔐 Lock", callback_data=f"lock_now:{user_id}")],
+        [InlineKeyboardButton("📍 Change Position", callback_data=f"change_position:{user_id}")],
         [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")],
     ])
+
+@app.on_callback_query(filters.regex(r"^change_position:(\d+)$"))
+async def cb_change_position(client, query: CallbackQuery):
+    try:
+        user_id = query.from_user.id
+        current = get_text_position(user_id)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"📍 At Start{' ✓' if current=='start' else ''}", callback_data=f"set_position_start:{user_id}")],
+            [InlineKeyboardButton(f"📍 At End{' ✓' if current=='end' else ''}", callback_data=f"set_position_end:{user_id}")],
+            [InlineKeyboardButton("🔙 Back", callback_data=f"back_settings:{user_id}")]
+        ])
+        await query.message.edit_text(
+            "📍 Text Position\n\n"
+            f"Current: <b>{current.capitalize()}</b>\n\n"
+            "Examples:\n"
+            "• Start: <code>@tag Document.pdf</code>\n"
+            "• End: <code>Document @tag.pdf</code>",
+            reply_markup=kb,
+            parse_mode="html"
+        )
+    except Exception as e:
+        logger.error(f"cb_change_position error: {e}")
+
+@app.on_callback_query(filters.regex(r"^set_position_(start|end):(\d+)$"))
+async def cb_set_position(client, query: CallbackQuery):
+    try:
+        data = query.data
+        pos = 'start' if 'start' in data else 'end'
+        user_id = query.from_user.id
+        set_text_position(user_id, pos)
+        await query.answer(f"Position set to {pos}")
+        # Refresh position menu
+        await cb_change_position(client, query)
+    except Exception as e:
+        logger.error(f"cb_set_position error: {e}")
+
+@app.on_callback_query(filters.regex(r"^back_settings:(\d+)$"))
+async def cb_back_settings(client, query: CallbackQuery):
+    try:
+        user_id = query.from_user.id
+        kb = build_pdf_actions_keyboard(user_id)
+        await query.message.edit_text("Choose an action:", reply_markup=kb)
+    except Exception as e:
+        logger.error(f"cb_back_settings error: {e}")
 
 @app.on_message(filters.document & filters.private)
 async def handle_document(client, message: Message):
@@ -1597,7 +1634,7 @@ async def remove_page_logic(client, query, user_id, page_number):
             
             # Send the modified file directly (no confirmation message)
             username = session.get('username', '')
-            new_file_name = replace_username_in_filename(session.get('file_name', 'document.pdf'), username)
+            new_file_name = build_final_filename(user_id, session.get('file_name', 'document.pdf'))
             delay = session.get('delete_delay', AUTO_DELETE_DELAY)
             
             await send_and_delete(client, query.message.chat.id, output_path, new_file_name, delay_seconds=delay)
@@ -1700,9 +1737,13 @@ async def button_callback(client, query: CallbackQuery):
             sessions[user_id]['awaiting_batch_both_password'] = True
             await safe_edit_message(query,
                 "🛠️ **The Both - Batch**\n\n"
-                "Step 1/2: Send me the password (or 'none'):"
+                "This function will:\n"
+                "1. Unlock the PDF (if protected)\n"
+                "2. Remove selected pages\n"
+                "3. Clean @username and hashtags\n"
+                "4. Add your custom username\n\n"
+                "**Step 1/2:** Send me the password (or 'none' if not protected):"
             )
-        
         # FIXED: Added batch_both_first, batch_both_last, batch_both_middle, batch_both_manual handlers
         elif action == "batch_both_first":
             logger.info(f"🔍 DEBUG: batch_both_first called for user {user_id}")
@@ -1765,7 +1806,7 @@ async def button_callback(client, query: CallbackQuery):
                     try:
                         with pikepdf.open(file) as pdf:
                             total_pages = len(pdf.pages)
-                        middle = total_pages // 2 if total_pages % 2 == 0 else (total_pages // 2) + 1
+                        middle = total_pages // 2
                         os.remove(file)
                         await process_batch_both(client, query.message, user_id, password, str(middle))
                     except Exception as e:
@@ -1795,6 +1836,7 @@ async def button_callback(client, query: CallbackQuery):
             else:
                 logger.error(f"❌ batch_both_manual - No password found for user {user_id}")
                 await query.answer("❌ Password not found. Please restart with /process", show_alert=True)
+                await safe_edit_message(query, "❌ Error: missing password.\n\nPlease use `/process` to process again.")
         await safe_edit_message(query, "❌ Error: missing password.\n\nPlease use `/process` to process again.")
         return
     
@@ -2002,7 +2044,7 @@ async def button_callback(client, query: CallbackQuery):
             delay2 = session2.get('delete_delay', AUTO_DELETE_DELAY)
             username2 = session2.get('username')
             await send_and_delete(client, query.message.chat.id, out_path2,
-                                  replace_username_in_filename(Path(out_path2).name, username2),
+                                  build_final_filename(user_id, Path(out_path2).name),
                                   delay_seconds=delay2)
             # Remove processing message
             try:
@@ -2037,7 +2079,7 @@ async def button_callback(client, query: CallbackQuery):
             delay3 = session3.get('delete_delay', AUTO_DELETE_DELAY)
             username3 = session3.get('username')
             await send_and_delete(client, query.message.chat.id, out_path3,
-                                  replace_username_in_filename(Path(out_path3).name, username3),
+                                  build_final_filename(user_id, Path(out_path3).name),
                                   delay_seconds=delay3)
             # Remove processing message
             try:
@@ -2131,7 +2173,7 @@ async def button_callback(client, query: CallbackQuery):
             "Choose which page to remove:",
             reply_markup=get_remove_pages_buttons(user_id)
         )
-        sessions[user_id]['processing'] = False  # Libérer le flag pour les boutons
+        sessions[user_id]['processing'] = False  # Libérer le flag pour les boutons batch
         return
 
 @app.on_message(filters.text & filters.private)
@@ -2280,7 +2322,6 @@ async def handle_all_text(client, message: Message):
                     await asyncio.sleep(delay)
                     try:
                         await sent.delete()
-                        logger.info(f"Video message deleted after {delay}s")
                     except Exception as e:
                         logger.error(f"Error deleting video message: {e}")
                 
@@ -2494,7 +2535,7 @@ async def handle_all_text(client, message: Message):
                     new_pdf.save(output_path)
                 
                 # Nettoyer le nom du fichier
-                cleaned_name = replace_username_in_filename(file_name, username)
+                cleaned_name = build_final_filename(user_id, file_name)
                 
                 # Envoyer le fichier AVANT le message de succès
                 delay = session.get('delete_delay', AUTO_DELETE_DELAY)
@@ -2597,7 +2638,7 @@ async def process_batch_unlock(client, message, user_id, password):
                     with pikepdf.open(input_path, password=password if password.lower() != 'none' else '', allow_overwriting_input=True) as pdf:
                         pdf.save(output_path)
                     
-                    new_file_name = replace_username_in_filename(file_info['file_name'], username)
+                    new_file_name = build_final_filename(user_id, file_info['file_name'])
                     delay = session.get('delete_delay', AUTO_DELETE_DELAY)
                     await send_and_delete(client, message.chat.id, output_path, new_file_name, delay_seconds=delay)
                     
@@ -2687,7 +2728,7 @@ async def process_batch_pages(client, message, user_id, pages_text):
                             
                         new_pdf.save(output_path)
                     
-                    new_file_name = replace_username_in_filename(file_info['file_name'], username)
+                    new_file_name = build_final_filename(user_id, file_info['file_name'])
                     delay = session.get('delete_delay', AUTO_DELETE_DELAY)
                     await send_and_delete(client, message.chat.id, output_path, new_file_name, delay_seconds=delay)
                     
@@ -2779,7 +2820,7 @@ async def process_batch_both(client, message, user_id, password, pages_text):
                         
                         new_pdf.save(output_path)
                     
-                    new_file_name = replace_username_in_filename(file_info['file_name'], username)
+                    new_file_name = build_final_filename(user_id, file_info['file_name'])
                     delay = session.get('delete_delay', AUTO_DELETE_DELAY)
                     await send_and_delete(client, message.chat.id, output_path, new_file_name, delay_seconds=delay)
                     
@@ -2834,7 +2875,7 @@ async def process_unlock(client, message, session, password):
             
             # Nettoyer le nom du fichier
             username = session.get('username', '')
-            cleaned_name = replace_username_in_filename(session['file_name'], username)
+            cleaned_name = build_final_filename(user_id, session['file_name'])
             
             # Supprimer le message de statut
             try:
@@ -2895,7 +2936,7 @@ async def process_clean_username(client, message_or_query, session):
                 
                 # Nettoyer le nom du fichier
                 username = session.get('username', '')
-                cleaned_name = replace_username_in_filename(file_name, username)
+                cleaned_name = build_final_filename(user_id, file_name)
                 
                 # Supprimer le message de statut
                 try:
@@ -2919,7 +2960,7 @@ async def process_clean_username(client, message_or_query, session):
             
             # Nettoyer le nom du fichier
             username = session.get('username', '')
-            cleaned_name = replace_username_in_filename(file_name, username)
+            cleaned_name = build_final_filename(user_id, file_name)
             
             # Créer le nouveau chemin avec le nom nettoyé
             new_path = os.path.join(get_user_temp_dir(user_id), cleaned_name)
@@ -2987,7 +3028,7 @@ async def process_batch_clean(client, message, user_id):
                     with pikepdf.open(input_path, allow_overwriting_input=True) as pdf:
                         pdf.save(output_path)
                 username = sessions[user_id].get('username', '')
-                cleaned_name = replace_username_in_filename(file_name, username)
+                cleaned_name = build_final_filename(user_id, file_name)
                 delay = sessions[user_id].get('delete_delay', AUTO_DELETE_DELAY)
                 await send_and_delete(client, message.chat.id, output_path, cleaned_name, delay_seconds=delay)
 
@@ -3050,7 +3091,7 @@ async def process_pdf_batch_item(client, message, file_info, user_id):
                 
                 # Nettoyer le nom du fichier
                 username = sessions[user_id].get('username', '')
-                cleaned_name = replace_username_in_filename(file_name, username)
+                cleaned_name = build_final_filename(user_id, file_name)
                 
                 delay = sessions[user_id].get('delete_delay', AUTO_DELETE_DELAY)
                 await send_and_delete(client, message.chat.id, output_path, cleaned_name, delay_seconds=delay)
@@ -3603,7 +3644,7 @@ async def process_pages(client, message, session, pages_text):
                 return
             
             # Nettoyer le nom du fichier
-            cleaned_name = replace_username_in_filename(session['file_name'], username)
+            cleaned_name = build_final_filename(user_id, session['file_name'])
             
             # Supprimer le message de statut
             try:
@@ -3675,7 +3716,7 @@ async def process_pages_with_password(client, message, session, password, pages_
                 return
             
             # Nettoyer le nom du fichier
-            cleaned_name = replace_username_in_filename(session['file_name'], username)
+            cleaned_name = build_final_filename(user_id, session['file_name'])
             
             # Supprimer le message de statut
             try:
@@ -3733,6 +3774,7 @@ async def process_both(client, message, session, text):
 
 # ===== Commands: setbanner / view_banner / setpassword / reset_password / setextra_pages =====
 @app.on_message(filters.command(["setbanner"]) & filters.private)
+@admin_only
 async def cmd_setbanner(client, message: Message):
     uid = message.from_user.id
     # Force-join check
@@ -3744,6 +3786,7 @@ async def cmd_setbanner(client, message: Message):
 
 
 @app.on_message(filters.command(["view_banner", "viewbanner"]) & filters.private)
+@admin_only
 async def cmd_view_banner(client, message: Message):
     uid = message.from_user.id
     # Force-join check
@@ -3761,6 +3804,7 @@ async def cmd_view_banner(client, message: Message):
 
 
 @app.on_message(filters.command(["setpassword"]) & filters.private)
+@admin_only
 async def cmd_setpassword(client, message: Message):
     uid = message.from_user.id
     # Force-join check
@@ -3786,13 +3830,14 @@ async def cmd_setpassword(client, message: Message):
 
 
 @app.on_message(filters.command(["reset_password"]) & filters.private)
+@admin_only
 async def cmd_reset_password(client, message: Message):
     uid = message.from_user.id
     # Force-join check
     if not await is_user_in_channel(uid):
         await send_force_join_message(client, message)
         return
-    parts = message.text.strip().split(maxsplit=1)
+    parts = message.text.split(maxsplit=1)
     if len(parts) >= 2:
         update_user_pdf_settings(uid, lock_password=parts[1].strip())
         await client.send_message(message.chat.id, "🔐 New default password saved.")
@@ -3802,6 +3847,7 @@ async def cmd_reset_password(client, message: Message):
 
 
 @app.on_message(filters.command(["setextra_pages"]) & filters.private)
+@admin_only
 async def cmd_setextra_pages(client, message: Message):
     uid = message.from_user.id
     # Force-join check
@@ -4062,8 +4108,6 @@ async def cmd_pdf_edit(client, message: Message):
         sess["pdf_edit"] = {"work": in_path}
         sess["awaiting_pdf_edit_password"] = True
         await client.send_message(chat_id, "🔑 PDF is locked. Send password to unlock.")
-
-
 @app.on_message(filters.text & filters.private)
 async def on_text_pdf_edit_flow(client, message: Message):
     uid = message.from_user.id
@@ -4154,7 +4198,7 @@ async def _pdf_edit_finalize_and_send(client, uid: int, chat_id: int, input_path
             return
     file_name = sessions.get(uid, {}).get("file_name") or "document.pdf"
     delay = sessions.get(uid, {}).get('delete_delay', AUTO_DELETE_DELAY)
-    final_name = replace_username_in_filename(Path(file_name).name, sessions.get(uid, {}).get('username'))
+    final_name = build_final_filename(uid, Path(file_name).name)
     await send_and_delete(client, chat_id, out_path, final_name, delay_seconds=delay)
     sessions.get(uid, {}).pop("pdf_edit", None)
 
