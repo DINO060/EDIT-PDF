@@ -20,6 +20,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
 from pyrogram import Client, filters, idle
+from pyrogram.enums import ParseMode
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import UserNotParticipant, ChatAdminRequired, UsernameNotOccupied
 from pyrogram.enums import ChatMemberStatus
@@ -77,8 +78,12 @@ def clean_caption_with_username(original_caption: str, user_id: int = None) -> s
     if user_id:
         saved_username = get_saved_username(user_id)
         if saved_username:
-            # Ajouter le username sauvegardé à la fin
-            final_caption = f"{cleaned} {saved_username}".strip()
+            # Placer le tag selon la préférence utilisateur
+            pos = get_text_position(user_id)
+            if pos == 'start':
+                final_caption = f"{saved_username} {cleaned}".strip()
+            else:
+                final_caption = f"{cleaned} {saved_username}".strip()
             return final_caption
     
     # Si pas de username sauvegardé, retourner juste le texte nettoyé
@@ -108,6 +113,38 @@ def clean_filename(filename):
     # Nettoie les espaces multiples
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     return cleaned
+
+def build_final_filename(user_id: int, original_name: str) -> str:
+    """Build the final output filename with the user's tag placed at start or end.
+    - Cleans existing usernames and emojis from the base filename.
+    - Respects the text position preference stored via `set_text_position()`.
+    """
+    try:
+        base, ext = os.path.splitext(original_name)
+        if not ext:
+            ext = ".pdf"
+        # Clean base name from usernames/emojis/extra spaces
+        base = clean_filename(base)
+
+        # Fetch user's saved tag (persistent first, then session fallback)
+        username = get_saved_username(user_id) or sessions.get(user_id, {}).get('username', '')
+        if not username:
+            safe_base = re.sub(r'[\\/:*?"<>|]', '_', base).strip()
+            return f"{safe_base}{ext}"
+
+        pos = get_text_position(user_id)
+        if pos == 'start':
+            new_base = f"{username} {base}".strip()
+        else:
+            new_base = f"{base} {username}".strip()
+
+        # Sanitize forbidden filename characters
+        new_base = re.sub(r'[\\/:*?"<>|]', '_', new_base)
+        return f"{new_base}{ext}"
+    except Exception as e:
+        logger.error(f"build_final_filename error: {e}")
+        # Fallback to original name on error
+        return original_name
 
 def save_username(user_id, username):
     """Saves a user's username persistently"""
@@ -745,20 +782,6 @@ def extract_and_clean_pdf_text(page):
         logger.warning(f"Error extracting text: {e}")
     return ""
 
-# ... (rest of the code remains the same)
-        if hasattr(message, 'edit_message_text'):
-            return await message.edit_message_text(text)
-        # Sinon, on crée un nouveau message
-        else:
-            return await client.send_message(message.chat.id, text)
-    except Exception as e:
-        logger.error(f"Error creating/editing status: {e}")
-        # En cas d'erreur, envoyer un nouveau message
-        return await client.send_message(
-            message.chat.id if hasattr(message, 'chat') else message.from_user.id, 
-            text
-        )
-
 async def safe_edit_message(message, text):
     """Édite un message en évitant l'erreur MessageNotModified"""
     try:
@@ -1099,6 +1122,8 @@ def build_settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
     """Settings/parameters menu for per-user options."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📍 Change Position", callback_data=f"change_position:{user_id}")],
+        [InlineKeyboardButton("➕ Add/Edit Hashtag", callback_data="add_hashtag")],
+        [InlineKeyboardButton("🗑️ Remove Hashtag", callback_data="delete_username")],
         [InlineKeyboardButton("🔙 Back", callback_data=f"back_settings:{user_id}")],
     ])
 
@@ -1110,7 +1135,8 @@ async def cb_change_position(client, query: CallbackQuery):
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"📍 At Start{' ✓' if current=='start' else ''}", callback_data=f"set_position_start:{user_id}")],
             [InlineKeyboardButton(f"📍 At End{' ✓' if current=='end' else ''}", callback_data=f"set_position_end:{user_id}")],
-            [InlineKeyboardButton("🔙 Back", callback_data=f"back_settings:{user_id}")]
+            # In this submenu, Back should return to Settings menu, not main actions
+            [InlineKeyboardButton("🔙 Back", callback_data=f"back_to_settings:{user_id}")]
         ])
         await query.message.edit_text(
             "📍 Text Position\n\n"
@@ -1119,10 +1145,27 @@ async def cb_change_position(client, query: CallbackQuery):
             "• Start: <code>@tag Document.pdf</code>\n"
             "• End: <code>Document @tag.pdf</code>",
             reply_markup=kb,
-            parse_mode="html"
+            parse_mode=ParseMode.HTML
         )
     except Exception as e:
         logger.error(f"cb_change_position error: {e}")
+
+@app.on_callback_query(filters.regex(r"^add_hashtag$"))
+async def cb_add_hashtag(client, query: CallbackQuery):
+    try:
+        user_id = query.from_user.id
+        # Set state to await username/hashtag input
+        session = ensure_session_dict(user_id)
+        session['state'] = UserState.AWAITING_USERNAME.value
+        session['state_data'] = {}
+        # Backward compatibility with existing text handler
+        session['awaiting_username'] = True
+        await query.message.edit_text(
+            "🔖 Send a personalized keyword or @username to save as your tag (e.g., <code>@MyTag</code>).",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logger.error(f"cb_add_hashtag error: {e}")
 
 @app.on_callback_query(filters.regex(r"^settings$"))
 async def cb_settings(client, query: CallbackQuery):
@@ -1130,10 +1173,25 @@ async def cb_settings(client, query: CallbackQuery):
     try:
         user_id = query.from_user.id
         kb = build_settings_keyboard(user_id)
-        await query.message.edit_text(
-            "⚙️ Settings\n\nChoose what to configure:",
-            reply_markup=kb
-        )
+        # Show current hashtag (if any) and position like renambot
+        saved = get_saved_username(user_id)
+        current = saved or sessions.get(user_id, {}).get('username', '')
+        pos = get_text_position(user_id)
+        if current:
+            text = (
+                "⚙️ Settings\n\n"
+                f"📝 Hashtag: <code>{current}</code>\n"
+                f"📍 Position: {pos}\n\n"
+                "Choose an option:"
+            )
+        else:
+            text = (
+                "⚙️ Settings\n\n"
+                "📝 No hashtag set\n"
+                f"📍 Position: {pos}\n\n"
+                "Choose an option:"
+            )
+        await query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.error(f"cb_settings error: {e}")
 
@@ -1154,10 +1212,23 @@ async def cb_set_position(client, query: CallbackQuery):
 async def cb_back_settings(client, query: CallbackQuery):
     try:
         user_id = query.from_user.id
-        kb = build_pdf_actions_keyboard(user_id)
-        await query.message.edit_text("Choose an action:", reply_markup=kb)
+        # Return to the Start menu (same as /start)
+        start_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
+            [InlineKeyboardButton("📦 Sequence Mode", callback_data="batch_mode")]
+        ])
+        await query.message.edit_text(MESSAGES['start'], reply_markup=start_kb)
     except Exception as e:
         logger.error(f"cb_back_settings error: {e}")
+
+# New: Back to Settings from a Settings submenu (e.g., Change Position)
+@app.on_callback_query(filters.regex(r"^back_to_settings:(\d+)$"))
+async def cb_back_to_settings(client, query: CallbackQuery):
+    try:
+        # Simply reopen the Settings menu
+        await cb_settings(client, query)
+    except Exception as e:
+        logger.error(f"cb_back_to_settings error: {e}")
 
 @app.on_message(filters.document & filters.private)
 async def handle_document(client, message: Message):
@@ -2460,6 +2531,9 @@ async def handle_all_text(client, message: Message):
         if username:
             session['username'] = username
             session['awaiting_username'] = False
+            # Reset structured state as well
+            session['state'] = UserState.IDLE.value
+            session.pop('state_data', None)
             
             # NEW: Save persistently
             if save_username(user_id, username):
