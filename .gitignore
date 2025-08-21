@@ -13,3 +13,7 @@ __pycache__/
 downloads/
 temp_files/
 banners/
+*.session
+*.session-journal
+__pycache__/
+.env
