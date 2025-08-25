@@ -9,3 +9,8 @@ Pillow
 imagehash
 opencv-python
 numpy
+PyMuPDF
+Pillow
+imagehash
+opencv-python
+numpy
