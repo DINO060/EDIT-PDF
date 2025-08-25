@@ -2211,11 +2211,15 @@ async def button_callback(client, query: CallbackQuery):
             return
         
         elif action == "batch_lock":
+            # Auto-use saved default lock password if any; otherwise proceed without lock (no prompt)
             sessions[user_id]['batch_action'] = 'lock'
-            sessions[user_id]['awaiting_batch_lock_password'] = True
-            await query.edit_message_text("🔐 Send the lock password for all PDFs:")
-            # Do not keep processing active while waiting for user input
-            clear_processing_flag(user_id, source="batch_lock", reason="awaiting_input")
+            pw = (get_user_pdf_settings(user_id) or {}).get('lock_password') or ''
+            if not pw:
+                try:
+                    await query.edit_message_text("ℹ️ No default lock password — proceeding without lock for all PDFs.")
+                except Exception:
+                    pass
+            await process_batch_lock(client, query.message, user_id, pw)
             return
         # FIXED: Added batch_both_first, batch_both_last, batch_both_middle, batch_both_manual handlers
         elif action == "batch_both_first":
@@ -4844,17 +4848,16 @@ async def run_full_pipeline_and_send(client, chat_id: int, uid: int, unlock_pw: 
                 else:
                     final_lock_pw = lock_pw
             else:
-                # No explicit value provided; fall back to default if any, otherwise ask
+                # No explicit value provided; fall back to default if any, otherwise proceed without locking
                 default_pw = get_user_pdf_settings(uid).get("lock_password")
                 if default_pw:
                     final_lock_pw = default_pw
                 else:
-                    # Ask user for lock password and store pending params
-                    sess['awaiting_full_lock_password'] = True
-                    sess['full_pipeline_pending'] = {"pages_spec": pages_spec, "chat_id": chat_id}
-                    await status.edit_text("🔐 Send password to lock PDF (or 'skip' to send without lock).")
-                    logger.info("[FullPipeline] Awaiting lock password uid=%s", uid)
-                    return
+                    final_lock_pw = None
+                    try:
+                        await status.edit_text("ℹ️ No default lock password — proceeding without lock.")
+                    except Exception:
+                        pass
 
             # Finalize (lock + multi-clean + send)
             logger.info("[FullPipeline] Finalize step uid=%s lock=%s", uid, bool(final_lock_pw))
@@ -4988,12 +4991,14 @@ async def _pdf_edit_apply_pages_and_continue(client, uid: int, chat_id: int, pag
             sess.pop("pdf_edit", None)
             return
 
-    # Determine lock password
+    # Determine lock password: auto-use default if exists; otherwise proceed without locking
     default_pw = get_user_pdf_settings(uid).get("lock_password")
     if not default_pw:
-        sess["pdf_edit"]["work"] = after_banner
-        sess["awaiting_pdf_edit_lock_password"] = True
-        await client.send_message(chat_id, "🔐 Send password to lock PDF (or `skip` to send without lock).")
+        try:
+            await client.send_message(chat_id, "ℹ️ No default lock password — proceeding without lock.")
+        except Exception:
+            pass
+        await _pdf_edit_finalize_and_send(client, uid, chat_id, after_banner, None)
         return
     await _pdf_edit_finalize_and_send(client, uid, chat_id, after_banner, default_pw)
 
