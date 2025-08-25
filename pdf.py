@@ -43,6 +43,14 @@ API_HASH = get_env_or_config("API_HASH")
 BOT_TOKEN = get_env_or_config("BOT_TOKEN")
 ADMIN_IDS = get_env_or_config("ADMIN_IDS", "")
 
+# Timeouts (in seconds) for heavy blocking operations
+BANNER_CLEAN_TIMEOUT = int(os.getenv("BANNER_CLEAN_TIMEOUT", "60"))
+BANNER_ADD_TIMEOUT = int(os.getenv("BANNER_ADD_TIMEOUT", "60"))
+
+async def run_in_thread_with_timeout(func, *args, timeout: int = 60, **kwargs):
+    """Run a blocking function in a thread with an asyncio timeout."""
+    return await asyncio.wait_for(asyncio.to_thread(func, *args, **kwargs), timeout=timeout)
+
 # File to store usernames persistently
 USERNAMES_FILE = Path("usernames.json")
 
@@ -98,6 +106,9 @@ def clean_filename(filename):
     # Supprime tous les blocs [ ] ( ) { } < > contenant @ ou #
     cleaned = re.sub(r'[\[\(\{\<][^)\]\}\>]*[@#][^)\]\}\>]*[\]\)\}\>]', '', filename)
     
+    # Supprime les usernames seuls partout (ex: @user, @user_name)
+    cleaned = re.sub(r'@[_A-Za-z0-9]+', '', cleaned)
+    
     # Supprime tous les emojis
     emoji_pattern = re.compile(
         "["
@@ -109,6 +120,9 @@ def clean_filename(filename):
         u"\U000024C2-\U0001F251"
         "]+", flags=re.UNICODE)
     cleaned = emoji_pattern.sub(r'', cleaned)
+    
+    # Nettoie les paires de parenthèses/brackets vides restantes
+    cleaned = re.sub(r'[\[\(\{\<]\s*[\]\)\}\>]', '', cleaned)
     
     # Nettoie les espaces multiples
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
@@ -230,6 +244,10 @@ MESSAGES = {
         "/setpassword - Set default lock password\n"
         "/reset_password - Change default lock password\n"
         "/setextra_pages - Extract a page as image\n"
+        "/setbanied - Enable multi-banner add mode\n"
+        "/donebanied - Finish adding banners\n"
+        "/viewbanied - View saved banners\n"
+        "/deletebanied - Delete a banner by index or all\n"
         "/pdf_edit - Unlock → remove pages → add banner → lock\n"
         "/addfsub - Add forced-subscription channels (admin)\n"
         "/delfsub - Delete forced-subscription channels (admin)\n"
@@ -260,6 +278,25 @@ try:
     import psutil  # facultatif pour RAM/CPU
 except Exception:
     psutil = None
+
+# PDF banner cleaning dependencies
+try:
+    import fitz  # PyMuPDF used in handlers and banner conversion
+except Exception:
+    fitz = None
+
+# Pillow (for converting image banner to PDF on the fly)
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+
+try:
+    from utils.banner_cleaner import clean_pdf_banners
+except Exception:
+    # Fallback no-op if the utility is unavailable
+    def clean_pdf_banners(pdf_bytes: bytes, user_id: int, base_dir: str | Path = "data/banied") -> bytes:
+        return pdf_bytes
 
 START_TIME = time.time()
 
@@ -420,30 +457,195 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Initialize sessions and user batches
 sessions = {}
-user_batches = defaultdict(list)  # {user_id: [docs]}
+user_batches = {}  # {user_id: [docs]}
 TEMP_DIR = Path("temp_files")
 TEMP_DIR.mkdir(exist_ok=True)
 cleanup_task_started = False  # Flag pour éviter de démarrer plusieurs fois la tâche
 
-# ===== PDF user settings and helpers (banner/password/extract) =====
+def ensure_session_dict(user_id: int) -> dict:
+    """Ensure a session dict exists for the given user_id and return it."""
+    sess = sessions.get(user_id)
+    if sess is None:
+        sess = {}
+        sessions[user_id] = sess
+    return sess
+
+# --- Processing flag helpers with watchdog ---
+# Global watchdog timeout for any processing operation
+GLOBAL_PROCESS_MAX = int(os.getenv("GLOBAL_PROCESS_MAX", "180"))
+
+def set_processing_flag(user_id: int, chat_id: int | None = None, source: str = "") -> None:
+    """Set the processing flag with logging and start a watchdog to auto-clear on timeout."""
+    sess = ensure_session_dict(user_id)
+    # Cancel an existing watchdog if present
+    try:
+        task = sess.get('processing_watchdog')
+        if task and not task.done():
+            task.cancel()
+    except Exception:
+        pass
+    sess['processing'] = True
+    sess['processing_started'] = time.time()
+    if source:
+        sess['processing_source'] = source
+    if chat_id is not None:
+        sess['processing_chat_id'] = chat_id
+    logger.info(f"[processing] SET user=%s source=%s", user_id, sess.get('processing_source', source))
+    # Start watchdog
+    try:
+        sess['processing_watchdog'] = asyncio.create_task(_processing_watchdog(user_id))
+    except Exception as e:
+        logger.warning(f"[processing] Failed to start watchdog for user {user_id}: {e}")
+
+def clear_processing_flag(user_id: int, source: str = "", reason: str = "") -> None:
+    """Clear the processing flag with logging and cancel any watchdog."""
+    sess = ensure_session_dict(user_id)
+    # Cancel watchdog
+    try:
+        task = sess.pop('processing_watchdog', None)
+        if task and not task.done():
+            task.cancel()
+    except Exception:
+        pass
+    started = sess.get('processing_started') or time.time()
+    elapsed = time.time() - started if started else 0
+    sess['processing'] = False
+    # Do not remove processing_source/chat_id to allow post-mortem logs unless explicitly cleaned elsewhere
+    logger.info(
+        f"[processing] CLEAR user=%s source=%s elapsed=%.2fs reason=%s",
+        user_id,
+        sess.get('processing_source', source),
+        elapsed,
+        reason or "",
+    )
+
+async def _processing_watchdog(user_id: int):
+    """Auto-clear processing flag if it exceeds GLOBAL_PROCESS_MAX seconds."""
+    try:
+        await asyncio.sleep(GLOBAL_PROCESS_MAX)
+    except Exception:
+        return
+    sess = ensure_session_dict(user_id)
+    try:
+        if sess.get('processing'):
+            started = sess.get('processing_started') or (time.time() - GLOBAL_PROCESS_MAX)
+            elapsed = time.time() - started
+            # Only clear if elapsed >= timeout (protect against race conditions)
+            if elapsed >= GLOBAL_PROCESS_MAX:
+                src = sess.get('processing_source', 'unknown')
+                logger.warning(f"[processing] WATCHDOG CLEAR user={user_id} source={src} elapsed={elapsed:.2f}s")
+                sess['processing'] = False
+                # Notify user if possible
+                chat_id = sess.get('processing_chat_id')
+                if chat_id:
+                    try:
+                        await app.send_message(chat_id, "⏱️ Previous operation timed out. I've reset your session. Please try again.")
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.warning(f"[processing] Watchdog error for user {user_id}: {e}")
+
+def clear_user_batch(user_id: int) -> None:
+    """Reset the user's batch list safely without raising KeyError."""
+    user_batches[user_id] = []
+
+async def cleanup_temp_files():
+    """Background task: periodically remove old files from TEMP_DIR and prune empty dirs."""
+    # Defaults: run every 10 minutes, delete files older than 2 hours
+    try:
+        interval = int(os.getenv("TEMP_CLEANUP_INTERVAL", "600"))
+    except Exception:
+        interval = 600
+    try:
+        max_age = int(os.getenv("TEMP_FILE_MAX_AGE", "7200"))
+    except Exception:
+        max_age = 7200
+
+    while True:
+        try:
+            now = time.time()
+            # Iterate user temp directories
+            for entry in TEMP_DIR.iterdir():
+                if not entry.is_dir():
+                    continue
+                # Clean files in user dir
+                try:
+                    for p in entry.iterdir():
+                        try:
+                            if p.is_file():
+                                age = now - p.stat().st_mtime
+                                if age > max_age:
+                                    p.unlink(missing_ok=True)
+                            elif p.is_dir():
+                                # Optional: remove nested empty dirs
+                                try:
+                                    next(p.iterdir())
+                                except StopIteration:
+                                    p.rmdir()
+                        except Exception:
+                            # Best effort cleanup; continue
+                            pass
+                    # Remove user dir if empty
+                    try:
+                        next(entry.iterdir())
+                    except StopIteration:
+                        entry.rmdir()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"cleanup_temp_files error: {e}")
+
+        try:
+            await asyncio.sleep(interval)
+        except Exception:
+            # If event loop sleep fails, avoid busy loop
+            await asyncio.sleep(600)
+
+# Multi-banner storage (per user)
+BANIED_BASE_DIR = Path("data") / "banied"
+BANIED_BASE_DIR.mkdir(parents=True, exist_ok=True)
+# Tracks users currently adding banners
+BANIED_ADD_MODE: set[int] = set()
+
+def ensure_banied_dir(user_id: int) -> Path:
+    p = BANIED_BASE_DIR / str(user_id)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+def list_banied_images(user_id: int) -> list[Path]:
+    p = ensure_banied_dir(user_id)
+    imgs = [f for f in p.iterdir() if f.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}]
+    return sorted(imgs)
+
+def delete_banied(user_id: int, index: int | None = None) -> int:
+    """Delete one (1-based index) or all banners. Returns number deleted."""
+    files = list_banied_images(user_id)
+    if not files:
+        return 0
+    if index is None:
+        count = 0
+        for f in files:
+            try:
+                f.unlink(missing_ok=True)
+                count += 1
+            except Exception:
+                pass
+        return count
+    else:
+        if 1 <= index <= len(files):
+            try:
+                files[index - 1].unlink(missing_ok=True)
+                return 1
+            except Exception:
+                return 0
+        return 0
+
+# PDF user settings and helpers (banner/password/extract)
 BANNERS_DIR = Path("banners")
 BANNERS_DIR.mkdir(exist_ok=True)
 PDF_SETTINGS_FILE = Path("pdf_settings.json")
-
-# Optional dependencies
-try:
-    import fitz  # PyMuPDF
-except Exception:  # pragma: no cover
-    fitz = None
-
-try:
-    from PIL import Image
-except Exception:  # pragma: no cover
-    Image = None
-
-from pikepdf import PasswordError
-
 
 def _load_pdf_settings():
     try:
@@ -454,7 +656,6 @@ def _load_pdf_settings():
         logger.error(f"Error loading PDF settings: {e}")
     return {}
 
-
 def _save_pdf_settings(data: dict) -> None:
     try:
         with open(PDF_SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -462,11 +663,9 @@ def _save_pdf_settings(data: dict) -> None:
     except Exception as e:
         logger.error(f"Error saving PDF settings: {e}")
 
-
 def get_user_pdf_settings(user_id: int) -> dict:
     data = _load_pdf_settings()
     return data.get(str(user_id), {"banner_path": None, "lock_password": None})
-
 
 def update_user_pdf_settings(user_id: int, **patch) -> dict:
     data = _load_pdf_settings()
@@ -475,7 +674,6 @@ def update_user_pdf_settings(user_id: int, **patch) -> dict:
     data[str(user_id)] = current
     _save_pdf_settings(data)
     return current
-
 
 def _image_to_pdf(img_path: str) -> str:
     if Image is None:
@@ -487,13 +685,11 @@ def _image_to_pdf(img_path: str) -> str:
         im.save(out_pdf, "PDF", resolution=100.0)
     return str(out_pdf)
 
-
 def _ensure_banner_pdf_path(user_id: int) -> str | None:
     banner_path = get_user_pdf_settings(user_id).get("banner_path")
     if not banner_path or not os.path.exists(banner_path):
         return None
     return banner_path if banner_path.lower().endswith(".pdf") else _image_to_pdf(banner_path)
-
 
 def add_banner_pages_to_pdf(in_pdf: str, out_pdf: str, banner_pdf: str, place: str = "before") -> None:
     with pikepdf.open(in_pdf) as pdf, pikepdf.open(banner_pdf) as banner:
@@ -506,12 +702,10 @@ def add_banner_pages_to_pdf(in_pdf: str, out_pdf: str, banner_pdf: str, place: s
                 pdf.pages.append(p)
         pdf.save(out_pdf)
 
-
 def lock_pdf_with_password(in_pdf: str, out_pdf: str, password: str) -> None:
     with pikepdf.open(in_pdf) as pdf:
         enc = pikepdf.Encryption(user=password, owner=password, R=4)
         pdf.save(out_pdf, encryption=enc)
-
 
 def extract_page_to_png(pdf_path: str, page_number_1based: int, out_png: str, zoom: float = 2.0) -> str:
     if fitz is None:
@@ -523,7 +717,6 @@ def extract_page_to_png(pdf_path: str, page_number_1based: int, out_png: str, zo
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
         pix.save(out_png)
     return out_png
-
 
 def parse_pages_spec(spec: str) -> list[int]:
     spec = (spec or "").strip().lower()
@@ -543,11 +736,94 @@ def parse_pages_spec(spec: str) -> list[int]:
             pages.add(int(chunk))
     return sorted(p for p in pages if p >= 1)
 
+def parse_pages_text(text: str) -> tuple[list[int], str | None]:
+    """Parse a user-provided pages string into a list of 1-based page numbers.
+    Returns (pages, error). Error is None if parsing succeeded.
+    Accepts formats like: "1,3-5". Returns [] for empty/none-like input.
+    """
+    spec = (text or "").strip()
+    if not spec:
+        return [], None
+    # Quick validation: allow digits, comma, dash and spaces only
+    if not re.fullmatch(r"[\d,\-\s]+", spec):
+        return [], "Invalid pages format. Use numbers, commas and dashes (e.g. 1,3-5)."
+    pages = parse_pages_spec(spec)
+    if not pages and spec and spec not in {"0", "none", "no", "non", "skip"}:
+        return [], "No valid pages found. Example: 1,3-5"
+    return pages, None
+
+def get_full_pages_buttons(user_id: int):
+    """Build the inline keyboard for Full Process page selection.
+    Provides quick options: First, Last, Middle, and Manual entry.
+    """
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("The First", callback_data=f"full_first:{user_id}"),
+            InlineKeyboardButton("The Last", callback_data=f"full_last:{user_id}"),
+        ],
+        [
+            InlineKeyboardButton("The Middle", callback_data=f"full_middle:{user_id}"),
+        ],
+        [
+            InlineKeyboardButton("Keep all pages (None)", callback_data=f"full_none:{user_id}"),
+        ],
+        [
+            InlineKeyboardButton("📝 Enter manually", callback_data=f"full_manual:{user_id}"),
+        ],
+    ])
+    return keyboard
+
+def get_pdf_edit_pages_buttons(user_id: int):
+    """Inline keyboard for /pdf_edit page selection (First/Last/Middle/Manual)."""
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("The First", callback_data=f"edit_first:{user_id}"),
+            InlineKeyboardButton("The Last", callback_data=f"edit_last:{user_id}"),
+        ],
+        [
+            InlineKeyboardButton("The Middle", callback_data=f"edit_middle:{user_id}"),
+        ],
+        [
+            InlineKeyboardButton("📝 Enter manually", callback_data=f"edit_manual:{user_id}"),
+        ],
+    ])
+    return keyboard
+
+def get_remove_pages_buttons(user_id: int):
+    """Inline keyboard for The Both -> Remove Pages (First/Last/Middle/Manual)."""
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("The First", callback_data=f"both_first:{user_id}"),
+            InlineKeyboardButton("The Last", callback_data=f"both_last:{user_id}"),
+        ],
+        [
+            InlineKeyboardButton("The Middle", callback_data=f"both_middle:{user_id}"),
+        ],
+        [
+            InlineKeyboardButton("📝 Enter manually", callback_data=f"both_manual:{user_id}"),
+        ],
+    ])
+    return keyboard
+
+def get_batch_both_pages_buttons(user_id: int):
+    """Inline keyboard for Batch 'The Both' page selection (First/Last/Middle/Manual)."""
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("The First", callback_data=f"batch_both_first:{user_id}"),
+            InlineKeyboardButton("The Last", callback_data=f"batch_both_last:{user_id}"),
+        ],
+        [
+            InlineKeyboardButton("The Middle", callback_data=f"batch_both_middle:{user_id}"),
+        ],
+        [
+            InlineKeyboardButton("📝 Enter manually", callback_data=f"batch_both_manual:{user_id}"),
+        ],
+    ])
+    return keyboard
 
 def unlock_pdf(in_pdf: str, out_pdf: str, password: str) -> None:
     with pikepdf.open(in_pdf, password=password) as pdf:
         pdf.save(out_pdf)
-
 
 def remove_pages_by_numbers(in_pdf: str, out_pdf: str, one_based_pages: list[int]) -> None:
     with pikepdf.open(in_pdf) as pdf:
@@ -565,7 +841,7 @@ def remove_pages_by_numbers(in_pdf: str, out_pdf: str, one_based_pages: list[int
 # Protection globale contre les doublons et rate limiting
 processed_messages = {}
 user_last_command = {}  # {user_id: (command, timestamp)}
-user_actions = defaultdict(list)  # Pour le rate limiting
+user_actions = {}  # Pour le rate limiting
 
 def check_rate_limit(user_id):
     """Vérifie si l'utilisateur n'abuse pas"""
@@ -580,7 +856,7 @@ def check_rate_limit(user_id):
     current_time = datetime.now()
     # Nettoyer les anciennes actions
     user_actions[user_id] = [
-        t for t in user_actions[user_id] 
+        t for t in user_actions.get(user_id, []) 
         if (current_time - t).seconds < 60
     ]
     
@@ -642,11 +918,9 @@ async def send_limit_message(client, chat_id, limit_type):
         )
 
 def reset_session_flags(user_id):
-    """Réinitialise tous les flags de session pour un utilisateur"""
+    """Réinitialise les flags temporaires de session (ne touche pas batch_mode)"""
     if user_id in sessions:
         sessions[user_id].pop('just_processed', None)
-        sessions[user_id].pop('processing', None)
-        sessions[user_id].pop('batch_mode', None)
 
 async def set_just_processed_flag(user_id, delay=1):
     """Marque qu'un fichier vient d'être traité et réinitialise le flag après un délai"""
@@ -662,7 +936,7 @@ async def set_just_processed_flag(user_id, delay=1):
         asyncio.create_task(reset_flag())
 
 app = Client(
-    "pdfbot",
+    "pdfbot-dev",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
@@ -794,6 +1068,28 @@ async def safe_edit_message(message, text):
             logger.error(f"Error editing message: {e}")
             raise e
 
+async def create_or_edit_status(client, origin, text: str):
+    """Create a new status message in the current chat and return it.
+    Works with both Message and CallbackQuery.message origins.
+    """
+    # Resolve chat id from origin (Message or CallbackQuery.message)
+    chat_id = None
+    try:
+        chat_id = origin.chat.id
+    except Exception:
+        try:
+            chat_id = origin.message.chat.id
+        except Exception:
+            chat_id = None
+    if chat_id is None:
+        logger.error("create_or_edit_status: unable to resolve chat_id from origin")
+        raise ValueError("Cannot resolve chat_id for status message")
+    try:
+        return await client.send_message(chat_id, text)
+    except Exception as e:
+        logger.error(f"create_or_edit_status error: {e}")
+        raise
+
 async def send_and_delete(client, chat_id, file_path, file_name, caption=None, delay_seconds=AUTO_DELETE_DELAY):
     """Envoie un document et le supprime automatiquement après un délai"""
     try:
@@ -873,6 +1169,11 @@ async def start_handler(client, message: Message):
     # S'assurer que la session existe et mettre à jour l'activité
     session = ensure_session_dict(user_id)
     session['last_activity'] = datetime.now()
+
+    # If user is in banner-add mode, ignore normal document flow
+    if user_id in BANIED_ADD_MODE:
+        await client.send_message(message.chat.id, "🪧 Tu es en mode ajout de bannières. Envoie des images/PDF ou /donebanied pour terminer.")
+        return
     
     # 🔥 VÉRIFICATION FORCE JOIN 🔥
     if not await is_user_in_channel(user_id):
@@ -924,7 +1225,7 @@ async def start_handler(client, message: Message):
     # Réinitialiser complètement la session
     delete_delay = session.get('delete_delay', AUTO_DELETE_DELAY)
     
-    user_batches[user_id].clear()
+    clear_user_batch(user_id)
     session.clear()
     
     # NEW: Restore username from file
@@ -1086,6 +1387,9 @@ async def process_batch_command(client, message: Message):
             [InlineKeyboardButton("🔓 Unlock all", callback_data=f"batch_unlock:{user_id}")],
             [InlineKeyboardButton("🗑️ Remove pages (all)", callback_data=f"batch_pages:{user_id}")],
             [InlineKeyboardButton("🛠️ The Both (all)", callback_data=f"batch_both:{user_id}")],
+            [InlineKeyboardButton("⚡ Full Process (all)", callback_data=f"batch_fullproc:{user_id}")],
+            [InlineKeyboardButton("🪧 Add banner (all)", callback_data=f"batch_add_banner:{user_id}")],
+            [InlineKeyboardButton("🔐 Lock all", callback_data=f"batch_lock:{user_id}")],
             [InlineKeyboardButton("🧹 Clear sequence", callback_data=f"batch_clear:{user_id}")]
         ])
         await client.send_message(
@@ -1103,7 +1407,7 @@ async def process_batch_command(client, message: Message):
         message.chat.id,
         "✅ All videos processed!\n\nSend more files or /start to exit sequence mode."
     )
-    user_batches[user_id].clear()
+    clear_user_batch(user_id)
     sessions[user_id]['process_command_processing'] = False
 
 def build_pdf_actions_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -1697,12 +2001,21 @@ async def clean_name_callback(client, query: CallbackQuery):
         await query.answer("⚠️ An error occurred while cleaning the name.", show_alert=True)
 
 # 🔥 FONCTION DE LOGIQUE DE SUPPRESSION AVEC VÉRIFICATION DE VERROUILLAGE 🔥
-async def remove_page_logic(client, query, user_id, page_number):
+async def remove_page_logic(client, origin, user_id, page_number):
     """Common logic for deleting a page"""
     session = ensure_session_dict(user_id)
     file_id = session.get('file_id')
     if not file_id:
-        await query.edit_message_text("❌ No PDF file found.")
+        # Gracefully handle both CallbackQuery and Message
+        try:
+            await origin.edit_message_text("❌ No PDF file found.")
+        except Exception:
+            try:
+                chat_id = origin.chat.id
+            except Exception:
+                chat_id = None
+            if chat_id:
+                await client.send_message(chat_id, "❌ No PDF file found.")
         return
     
     file_path = await client.download_media(file_id, file_name=f"{get_user_temp_dir(user_id)}/input.pdf")
@@ -1712,11 +2025,19 @@ async def remove_page_logic(client, query, user_id, page_number):
         with pikepdf.open(file_path) as pdf:
             total_pages = len(pdf.pages)
             if page_number < 1 or page_number > total_pages:
-                await query.edit_message_text(f"❌ Invalid page number. The PDF has {total_pages} pages.")
+                try:
+                    await origin.edit_message_text(f"❌ Invalid page number. The PDF has {total_pages} pages.")
+                except Exception:
+                    try:
+                        chat_id = origin.chat.id
+                    except Exception:
+                        chat_id = None
+                    if chat_id:
+                        await client.send_message(chat_id, f"❌ Invalid page number. The PDF has {total_pages} pages.")
                 return
             
             # Delete the page
-            pdf.pages.pop(page_number - 1)
+            del pdf.pages[page_number - 1]
             
             # Save the modified PDF
             output_path = f"{get_user_temp_dir(user_id)}/modified_{session.get('file_name', 'document.pdf')}"
@@ -1727,13 +2048,30 @@ async def remove_page_logic(client, query, user_id, page_number):
             new_file_name = build_final_filename(user_id, session.get('file_name', 'document.pdf'))
             delay = session.get('delete_delay', AUTO_DELETE_DELAY)
             
-            await send_and_delete(client, query.message.chat.id, output_path, new_file_name, delay_seconds=delay)
-            await query.edit_message_text(f"✅ Page {page_number} deleted successfully!")
+            # Determine chat id from origin (CallbackQuery or Message)
+            try:
+                chat_id = origin.message.chat.id
+            except Exception:
+                chat_id = origin.chat.id
+            await send_and_delete(client, chat_id, output_path, new_file_name, delay_seconds=delay)
+            try:
+                await origin.edit_message_text(f"✅ Page {page_number} deleted successfully!")
+            except Exception:
+                # Fallback to sending a new message
+                await client.send_message(chat_id, f"✅ Page {page_number} deleted successfully!")
             
             # ✅ FIX: Reset processing flag after successful page removal
-            sessions[user_id]['processing'] = False
+            clear_processing_flag(user_id, source="remove_page", reason="completed")
     except pikepdf.PasswordError:
-        await query.edit_message_text("❌ Cannot delete page (PDF protected)")
+        try:
+            await origin.edit_message_text("❌ Cannot delete page (PDF protected)")
+        except Exception:
+            try:
+                chat_id = origin.chat.id
+            except Exception:
+                chat_id = None
+            if chat_id:
+                await client.send_message(chat_id, "❌ Cannot delete page (PDF protected)")
 
 @app.on_callback_query() 
 async def button_callback(client, query: CallbackQuery):
@@ -1754,14 +2092,37 @@ async def button_callback(client, query: CallbackQuery):
     # Reset tous les flags temporaires au début
     reset_session_flags(user_id)
     
-    # Check if action is already in progress (except for clean_username, settings, and delay)
-    if sessions[user_id].get('processing') and not data.startswith("clean_username") and not data.startswith("delay_") and data not in ["settings", "set_delete_delay", "back_to_start"]:
+    # Check if action is already in progress, but allow UI-only callbacks (prompts) to go through
+    if (
+        sessions[user_id].get('processing')
+        and not data.startswith("clean_username")
+        and not data.startswith("delay_")
+        and not data.startswith("full_")
+        and not data.startswith("batch_fullproc")
+        and not data.startswith("batch_pages")
+        and not data.startswith("batch_unlock")
+        and not data.startswith("batch_both")
+        and not data.startswith("batch_lock")
+        and data not in ["settings", "set_delete_delay", "back_to_start"]
+    ):
         await query.answer("⏳ Processing already in progress...", show_alert=True)
         return
     
-    # Don't mark processing=True for clean_username, settings, and delay
-    if not data.startswith("clean_username") and not data.startswith("cancel") and not data.startswith("delay_") and data not in ["settings", "set_delete_delay", "back_to_start"]:
-        sessions[user_id]['processing'] = True
+    # Don't mark processing=True for clean_username, settings, delay, full_* selectors, and batch UI prompts
+    if (
+        not data.startswith("clean_username")
+        and not data.startswith("cancel")
+        and not data.startswith("delay_")
+        and not data.startswith("full_")
+        and not data.startswith("batch_fullproc")
+        and not data.startswith("batch_pages")
+        and not data.startswith("batch_unlock")
+        and not data.startswith("batch_both")
+        and not data.startswith("batch_lock")
+        and not data.startswith("edit_")
+        and data not in ["settings", "set_delete_delay", "back_to_start"]
+    ):
+        set_processing_flag(user_id, chat_id=query.message.chat.id, source=f"cb:{data}")
     
     # Batch mode handling
     if data == "batch_mode":
@@ -1776,7 +2137,7 @@ async def button_callback(client, query: CallbackQuery):
             f"🔄 Send `/process` when you're done adding files\n\n"
             f"To disable batch mode, send `/start`"
         )
-        sessions[user_id]['processing'] = False
+        clear_processing_flag(user_id, source="batch_mode", reason="menu_shown")
         return
     
     # Batch clear handling
@@ -1784,9 +2145,9 @@ async def button_callback(client, query: CallbackQuery):
         user_id = int(data.split(":")[1])
         if user_id not in user_batches:
             user_batches[user_id] = []
-        user_batches[user_id].clear()
+        clear_user_batch(user_id)
         await query.edit_message_text("🧹 Batch cleared successfully!")
-        sessions[user_id]['processing'] = False
+        clear_processing_flag(user_id, source="batch_clear", reason="done")
         return
     
     # Batch actions handling - FIXED SECTION
@@ -1811,6 +2172,9 @@ async def button_callback(client, query: CallbackQuery):
             sessions[user_id]['batch_action'] = 'unlock'
             sessions[user_id]['awaiting_batch_password'] = True
             await query.edit_message_text("🔐 Send me the password for all PDFs:")
+            # Do not keep processing active while waiting for user input
+            clear_processing_flag(user_id, source="batch_unlock", reason="awaiting_input")
+            return
         
         elif action == "batch_pages":
             sessions[user_id]['batch_action'] = 'pages'
@@ -1821,6 +2185,9 @@ async def button_callback(client, query: CallbackQuery):
                 "• 1,3,5 → removes pages 1, 3 and 5\n"
                 "• 1-5 → removes pages 1 to 5"
             )
+            # Do not keep processing active while waiting for user input
+            clear_processing_flag(user_id, source="batch_pages", reason="awaiting_input")
+            return
         
         elif action == "batch_both":
             sessions[user_id]['batch_action'] = 'both'
@@ -1834,6 +2201,22 @@ async def button_callback(client, query: CallbackQuery):
                 "4. Add your custom username\n\n"
                 "**Step 1/2:** Send me the password (or 'none' if not protected):"
             )
+            # Do not keep processing active while waiting for user input
+            clear_processing_flag(user_id, source="batch_both", reason="awaiting_input")
+            return
+        
+        elif action == "batch_add_banner":
+            sessions[user_id]['batch_action'] = 'add_banner'
+            await process_batch_add_banner(client, query.message, user_id)
+            return
+        
+        elif action == "batch_lock":
+            sessions[user_id]['batch_action'] = 'lock'
+            sessions[user_id]['awaiting_batch_lock_password'] = True
+            await query.edit_message_text("🔐 Send the lock password for all PDFs:")
+            # Do not keep processing active while waiting for user input
+            clear_processing_flag(user_id, source="batch_lock", reason="awaiting_input")
+            return
         # FIXED: Added batch_both_first, batch_both_last, batch_both_middle, batch_both_manual handlers
         elif action == "batch_both_first":
             logger.info(f"🔍 DEBUG: batch_both_first called for user {user_id}")
@@ -1854,11 +2237,13 @@ async def button_callback(client, query: CallbackQuery):
             
             if password:
                 await process_batch_both(client, query.message, user_id, password, "1")
+                return
             else:
                 logger.error(f"❌ batch_both_first - No password found for user {user_id}")
                 logger.error(f"❌ DEBUG: Session content: {session}")
                 await query.answer("❌ Password not found. Please restart with /process", show_alert=True)
                 await safe_edit_message(query, "❌ Error: missing password.\n\nPlease use `/process` to start again.")
+                return
         
         elif action == "batch_both_last":
             # FIX: Utiliser ensure_session_dict
@@ -1874,15 +2259,19 @@ async def button_callback(client, query: CallbackQuery):
                             total_pages = len(pdf.pages)
                         os.remove(file)
                         await process_batch_both(client, query.message, user_id, password, str(total_pages))
+                        return
                     except Exception as e:
                         logger.error(f"Error getting last page: {e}")
                         await safe_edit_message(query, "❌ Error reading PDF")
+                        return
                 else:
                     await safe_edit_message(query, "❌ No files in batch")
+                    return
             else:
                 logger.error(f"❌ batch_both_last - No password found for user {user_id}")
                 await query.answer("❌ Password not found. Please restart with /process", show_alert=True)
                 await safe_edit_message(query, "❌ Error: missing password.\n\nPlease use `/process` to start again.")
+                return
         
         elif action == "batch_both_middle":
             # FIX: Utiliser ensure_session_dict
@@ -1899,15 +2288,19 @@ async def button_callback(client, query: CallbackQuery):
                         middle = total_pages // 2
                         os.remove(file)
                         await process_batch_both(client, query.message, user_id, password, str(middle))
+                        return
                     except Exception as e:
                         logger.error(f"Error getting middle page: {e}")
                         await safe_edit_message(query, "❌ Error reading PDF")
+                        return
                 else:
                     await safe_edit_message(query, "❌ No files in batch")
+                    return
             else:
                 logger.error(f"❌ batch_both_middle - No password found for user {user_id}")
                 await query.answer("❌ Password not found. Please restart with /process", show_alert=True)
                 await safe_edit_message(query, "❌ Error: missing password.\n\nPlease use `/process` to start again.")
+                return
         
         elif action == "batch_both_manual":
             # FIX: Utiliser ensure_session_dict et vérifier le password
@@ -1923,12 +2316,14 @@ async def button_callback(client, query: CallbackQuery):
                     "• 1,3,5 → removes pages 1, 3 and 5\n"
                     "• 1-5 → removes pages 1 to 5"
                 )
+                # Do not keep processing active while waiting for user input
+                clear_processing_flag(user_id, source="batch_both_manual", reason="awaiting_input")
+                return
             else:
                 logger.error(f"❌ batch_both_manual - No password found for user {user_id}")
                 await query.answer("❌ Password not found. Please restart with /process", show_alert=True)
                 await safe_edit_message(query, "❌ Error: missing password.\n\nPlease use `/process` to process again.")
-        await safe_edit_message(query, "❌ Error: missing password.\n\nPlease use `/process` to process again.")
-        return
+                return
     
     # Gestion des paramètres
     if data == "settings":
@@ -1938,11 +2333,11 @@ async def button_callback(client, query: CallbackQuery):
             [InlineKeyboardButton("🔙 Back", callback_data="back_to_start")]
         ])
         await query.edit_message_text(
-            "⚙️ **Settings**\n\n"
+            "⚙️ **Settings Panel**\n\n"
             "Configure the bot according to your needs.",
             reply_markup=keyboard
         )
-        sessions[user_id]['processing'] = False
+        clear_processing_flag(user_id, source="settings", reason="menu_shown")
         return
     
     elif data == "set_delete_delay":
@@ -2026,7 +2421,7 @@ async def button_callback(client, query: CallbackQuery):
     
     # Gestion des actions PDF
     if ":" not in data:
-        sessions[user_id]['processing'] = False
+        clear_processing_flag(user_id, source="no_action", reason="no_colon")
         return
     
     action, user_id = data.split(":")
@@ -2040,7 +2435,7 @@ async def button_callback(client, query: CallbackQuery):
         # S'assurer que la session contient les données nécessaires
         if 'file_id' not in sessions[user_id]:
             await query.edit_message_text("❌ No file in session. Send a PDF first.")
-            sessions[user_id]['processing'] = False
+            clear_processing_flag(user_id, source="clean_username", reason="no_file")
             return
         await process_clean_username(client, query.message, sessions[user_id])
         return
@@ -2051,7 +2446,7 @@ async def button_callback(client, query: CallbackQuery):
     
     if user_id not in sessions:
         await query.edit_message_text("❌ Session expired. Send the PDF again.")
-        sessions[user_id]['processing'] = False
+        clear_processing_flag(user_id, source="expired", reason="no_session")
         return
     
     sessions[user_id]['action'] = action
@@ -2075,24 +2470,26 @@ async def button_callback(client, query: CallbackQuery):
             "• 1-5 → removes pages 1 to 5",
             reply_markup=page_buttons
         )
-        sessions[user_id]['processing'] = False  # Libérer le flag pour les boutons
+        clear_processing_flag(user_id, source="remove_pages_menu", reason="menu_shown")  # Libérer le flag pour les boutons
     elif action == "both":
         # Show options for "The Both" action
         both_options = InlineKeyboardMarkup([
             [InlineKeyboardButton("🪧 Add banner", callback_data=f"add_banner:{user_id}"), InlineKeyboardButton("🔐 Lock", callback_data=f"lock_now:{user_id}")],
-            [InlineKeyboardButton("🛠️ Full Both Process", callback_data=f"both_full:{user_id}")],
+            [InlineKeyboardButton("Remove/Unlock", callback_data=f"both_full:{user_id}")],
             [InlineKeyboardButton("🗑️ Remove Pages Only", callback_data=f"both_remove_pages:{user_id}")],
             [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")],
         ])
-        await query.edit_message_text(
+        await client.send_message(
+            query.message.chat.id,
             "🛠️ **The Both** - Combined action\n\n"
-            "Choose an option:\n"
-            "• **Full Both Process**: Unlock + Remove pages + Clean usernames\n"
-            "• **Remove Pages Only**: Just remove selected pages\n\n"
+            "This function will:\n"
+            "1. Unlock the PDF (if protected)\n"
+            "2. Clean @username and hashtags\n"
+            "3. Add your custom username\n\n"
             "What do you want to do?",
             reply_markup=both_options
         )
-        sessions[user_id]['processing'] = False  # Libérer le flag pour les boutons
+        clear_processing_flag(user_id, source="both_menu", reason="menu_shown")  # Libérer le flag pour les boutons
         return
     elif action == "both_full":
         sessions[user_id]['awaiting_both_password'] = True
@@ -2112,25 +2509,70 @@ async def button_callback(client, query: CallbackQuery):
             "Choose which page to remove:",
             reply_markup=get_remove_pages_buttons(user_id)
         )
-        sessions[user_id]['processing'] = False  # Libérer le flag pour les boutons
+        clear_processing_flag(user_id, source="both_remove_pages_menu", reason="menu_shown")  # Libérer le flag pour les boutons
+        return
+    elif action in ("fullproc", "batch_fullproc"):
+        # Start FULL PROCESS: ask for unlock password first
+        logger.info(f"[fullproc_init] User %s triggered %s", user_id, action)
+        sessions[user_id]['awaiting_full_password'] = True
+        # Track if this is the batch mode launcher to adjust subsequent flow
+        sessions[user_id]['fullproc_is_batch'] = (action == "batch_fullproc")
+        await safe_edit_message(
+            query,
+            "⚡️ **Full Process**\n\n"
+            "This will: Unlock (if needed) → Clean banners → Add banner → Remove pages → Lock → Send.\n\n"
+            "Step 1/2: Send the PDF password (or 'none' if not protected)."
+        )
+        # Free the flag so the user can press selection buttons without being blocked
+        clear_processing_flag(user_id, source="fullproc_init", reason="awaiting_unlock_pw")
         return
     elif action == "add_banner":
         # Add default banner immediately
         banner_pdf = _ensure_banner_pdf_path(user_id)
         if not banner_pdf:
             await query.edit_message_text("❌ No default banner. Use /setbanner first.")
-            sessions[user_id]['processing'] = False
+            clear_processing_flag(user_id, source="add_banner", reason="no_default_banner")
             return
         session2 = ensure_session_dict(user_id)
         file_id2 = session2.get('file_id')
         file_name2 = session2.get('file_name') or 'document.pdf'
         user_dir2 = get_user_temp_dir(user_id)
+        if not file_id2:
+            await query.edit_message_text("❌ No PDF in session.")
+            clear_processing_flag(user_id, source="add_banner", reason="no_pdf_in_session")
+            return
         in_path2 = await client.download_media(file_id2, file_name=user_dir2 / 'banner_input.pdf')
         out_path2 = str(user_dir2 / f"bannered_{file_name2}")
         # Show processing status
         status_msg = await client.send_message(query.message.chat.id, MESSAGES['processing'])
+        logger.info(f"[add_banner] Start for user %s", user_id)
+        cleaned_input = in_path2
         try:
-            add_banner_pages_to_pdf(in_path2, out_path2, banner_pdf, place='before')
+            # 1) Clean existing user banners from the input PDF (no-op if cleaner unavailable)
+            try:
+                logger.info("[add_banner] Cleaning banners for user %s", user_id)
+                with open(in_path2, 'rb') as f:
+                    raw_bytes = f.read()
+                cleaned_bytes = await run_in_thread_with_timeout(
+                    clean_pdf_banners, raw_bytes, user_id, base_dir=BANIED_BASE_DIR, timeout=BANNER_CLEAN_TIMEOUT
+                )
+                cleaned_input = str(Path(user_dir2) / 'banner_input_cleaned.pdf')
+                with open(cleaned_input, 'wb') as cf:
+                    cf.write(cleaned_bytes)
+                logger.info("[add_banner] Cleaning complete for user %s", user_id)
+            except asyncio.TimeoutError as te:
+                logger.warning(f"[add_banner] Cleaning timed out for user {user_id}: {te}")
+                cleaned_input = in_path2
+            except Exception as ce:
+                logger.warning(f"[add_banner] Cleaning failed or skipped for user {user_id}: {ce}")
+                # If cleaning fails for any reason, proceed with original input
+                cleaned_input = in_path2
+
+            # 2) Add the configured banner pages at the end
+            logger.info("[add_banner] Adding banner pages for user %s", user_id)
+            await run_in_thread_with_timeout(
+                add_banner_pages_to_pdf, cleaned_input, out_path2, banner_pdf, place='after', timeout=BANNER_ADD_TIMEOUT
+            )
             delay2 = session2.get('delete_delay', AUTO_DELETE_DELAY)
             username2 = session2.get('username')
             await send_and_delete(client, query.message.chat.id, out_path2,
@@ -2148,13 +2590,22 @@ async def button_callback(client, query: CallbackQuery):
             except:
                 pass
             await query.edit_message_text(f"❌ Error adding banner: {e}")
+        finally:
+            # Always clear processing flag and cleanup temporary cleaned file if created
+            clear_processing_flag(user_id, source="add_banner", reason="completed")
+            if cleaned_input and cleaned_input != in_path2:
+                try:
+                    os.remove(cleaned_input)
+                except Exception:
+                    pass
+            logger.info(f"[add_banner] Done for user %s (processing cleared)", user_id)
         return
     elif action == "lock_now":
         # Lock current PDF using default password
         password = get_user_pdf_settings(user_id).get('lock_password')
         if not password:
             await query.edit_message_text("❌ No password set. Use /setpassword first.")
-            sessions[user_id]['processing'] = False
+            clear_processing_flag(user_id, source="lock_now", reason="no_password_configured")
             return
         session3 = ensure_session_dict(user_id)
         file_id3 = session3.get('file_id')
@@ -2183,7 +2634,7 @@ async def button_callback(client, query: CallbackQuery):
             except:
                 pass
             await query.edit_message_text("❌ The PDF is locked. Please unlock it first, then try again.")
-            sessions[user_id]['processing'] = False
+            clear_processing_flag(user_id, source="lock_now", reason="pdf_locked")
             return
         except Exception as e:
             try:
@@ -2201,11 +2652,13 @@ async def button_callback(client, query: CallbackQuery):
         if not file_id:
             await query.answer("❌ No PDF in session.", show_alert=True)
             return
-        file_path = await client.download_media(file_id, file_name=f"{get_user_temp_dir(user_id)}/both_temp.pdf")
-        if is_pdf_locked(file_path):
-            await query.answer("❌ Cannot delete page (PDF is locked).", show_alert=True)
-            return
-        await delete_page_from_pdf(user_id, file_path, 0, query)
+        # Use unified logic (1-based index)
+        status_msg = await client.send_message(query.message.chat.id, "⏳ Remove pages en cours...")
+        await remove_page_logic(client, query, user_id, 1)
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
         return
     elif data.startswith("both_last:"):
         user_id = int(data.split(":")[1])
@@ -2214,12 +2667,25 @@ async def button_callback(client, query: CallbackQuery):
         if not file_id:
             await query.answer("❌ No PDF in session.", show_alert=True)
             return
-        file_path = await client.download_media(file_id, file_name=f"{get_user_temp_dir(user_id)}/both_temp.pdf")
-        if is_pdf_locked(file_path):
-            await query.answer("❌ Cannot delete page (PDF is locked).", show_alert=True)
+        # Compute last page by briefly opening the PDF
+        try:
+            tmp_info = await client.download_media(file_id, file_name=f"{get_user_temp_dir(user_id)}/both_info.pdf")
+            with pikepdf.open(tmp_info) as pdf:
+                last_page = len(pdf.pages)
+        except Exception as e:
+            await query.answer("❌ Error reading PDF.", show_alert=True)
             return
-        last_page = get_last_page_number(file_path)
-        await delete_page_from_pdf(user_id, file_path, last_page, query)
+        finally:
+            try:
+                os.remove(tmp_info)
+            except Exception:
+                pass
+        status_msg = await client.send_message(query.message.chat.id, "⏳ Remove pages en cours...")
+        await remove_page_logic(client, query, user_id, last_page)
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
         return
     elif data.startswith("both_middle:"):
         user_id = int(data.split(":")[1])
@@ -2228,13 +2694,26 @@ async def button_callback(client, query: CallbackQuery):
         if not file_id:
             await query.answer("❌ No PDF in session.", show_alert=True)
             return
-        file_path = await client.download_media(file_id, file_name=f"{get_user_temp_dir(user_id)}/both_temp.pdf")
-        if is_pdf_locked(file_path):
-            await query.answer("❌ Cannot delete page (PDF is locked).", show_alert=True)
+        # Compute middle page
+        try:
+            tmp_info = await client.download_media(file_id, file_name=f"{get_user_temp_dir(user_id)}/both_info.pdf")
+            with pikepdf.open(tmp_info) as pdf:
+                n = len(pdf.pages)
+            middle = max(1, (n + 1) // 2)
+        except Exception as e:
+            await query.answer("❌ Error reading PDF.", show_alert=True)
             return
-        last_page = get_last_page_number(file_path)
-        middle = last_page // 2
-        await delete_page_from_pdf(user_id, file_path, middle, query)
+        finally:
+            try:
+                os.remove(tmp_info)
+            except Exception:
+                pass
+        status_msg = await client.send_message(query.message.chat.id, "⏳ Remove pages en cours...")
+        await remove_page_logic(client, query, user_id, middle)
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
         return
     elif data.startswith("both_manual:"):
         user_id = int(data.split(":")[1])
@@ -2263,7 +2742,145 @@ async def button_callback(client, query: CallbackQuery):
             "Choose which page to remove:",
             reply_markup=get_remove_pages_buttons(user_id)
         )
-        sessions[user_id]['processing'] = False  # Libérer le flag pour les boutons batch
+        # Inform the user
+        try:
+            await client.send_message(query.message.chat.id, "🗑️ Remove Pages menu opened. Select an option.")
+        except Exception:
+            pass
+        clear_processing_flag(user_id, source="batch_remove_pages_menu", reason="menu_shown")  # Libérer le flag pour les boutons batch
+        return
+    # ==== FULL PROCESS page selection handlers ====
+    elif data.startswith("full_first:"):
+        uid = int(data.split(":")[1])
+        if query.from_user.id != uid:
+            await query.answer("❌ This is not for you!", show_alert=True)
+            return
+        sess2 = ensure_session_dict(uid)
+        sess2.pop('awaiting_both_pages', None)
+        logger.info("[fullproc_select] user=%s pages=first", uid)
+        pw = sess2.get('full_password', '')
+        # If launched from batch, process the entire batch instead of single session file
+        if sess2.get('fullproc_is_batch'):
+            default_pw = get_user_pdf_settings(uid).get("lock_password")
+            if not default_pw:
+                # Ask once for lock password, then run batch
+                sess2['awaiting_full_lock_password'] = True
+                sess2['full_pipeline_pending'] = {"pages_spec": 'first', "chat_id": query.message.chat.id, "batch": True}
+                await safe_edit_message(query, "🔐 Send password to lock PDF (or 'skip' to send without lock).")
+                return
+            await run_full_pipeline_batch_and_send(client, query.message.chat.id, uid, pw, pages_spec='first', lock_pw=default_pw)
+            return
+        await run_full_pipeline_and_send(client, query.message.chat.id, uid, pw, pages_spec='first')
+        return
+    elif data.startswith("full_last:"):
+        uid = int(data.split(":")[1])
+        if query.from_user.id != uid:
+            await query.answer("❌ This is not for you!", show_alert=True)
+            return
+        sess2 = ensure_session_dict(uid)
+        sess2.pop('awaiting_both_pages', None)
+        logger.info("[fullproc_select] user=%s pages=last", uid)
+        pw = sess2.get('full_password', '')
+        if sess2.get('fullproc_is_batch'):
+            default_pw = get_user_pdf_settings(uid).get("lock_password")
+            if not default_pw:
+                sess2['awaiting_full_lock_password'] = True
+                sess2['full_pipeline_pending'] = {"pages_spec": 'last', "chat_id": query.message.chat.id, "batch": True}
+                await safe_edit_message(query, "🔐 Send password to lock PDF (or 'skip' to send without lock).")
+                return
+            await run_full_pipeline_batch_and_send(client, query.message.chat.id, uid, pw, pages_spec='last', lock_pw=default_pw)
+            return
+        await run_full_pipeline_and_send(client, query.message.chat.id, uid, pw, pages_spec='last')
+        return
+    elif data.startswith("full_middle:"):
+        uid = int(data.split(":")[1])
+        if query.from_user.id != uid:
+            await query.answer("❌ This is not for you!", show_alert=True)
+            return
+        sess2 = ensure_session_dict(uid)
+        sess2.pop('awaiting_both_pages', None)
+        logger.info("[fullproc_select] user=%s pages=middle", uid)
+        pw = sess2.get('full_password', '')
+        if sess2.get('fullproc_is_batch'):
+            default_pw = get_user_pdf_settings(uid).get("lock_password")
+            if not default_pw:
+                sess2['awaiting_full_lock_password'] = True
+                sess2['full_pipeline_pending'] = {"pages_spec": 'middle', "chat_id": query.message.chat.id, "batch": True}
+                await safe_edit_message(query, "🔐 Send password to lock PDF (or 'skip' to send without lock).")
+                return
+            await run_full_pipeline_batch_and_send(client, query.message.chat.id, uid, pw, pages_spec='middle', lock_pw=default_pw)
+            return
+        await run_full_pipeline_and_send(client, query.message.chat.id, uid, pw, pages_spec='middle')
+        return
+    elif data.startswith("full_none:"):
+        uid = int(data.split(":")[1])
+        if query.from_user.id != uid:
+            await query.answer("❌ This is not for you!", show_alert=True)
+            return
+        sess2 = ensure_session_dict(uid)
+        sess2.pop('awaiting_both_pages', None)
+        logger.info("[fullproc_select] user=%s pages=none", uid)
+        pw = sess2.get('full_password', '')
+        # Run full pipeline keeping all pages (no deletion)
+        if sess2.get('fullproc_is_batch'):
+            default_pw = get_user_pdf_settings(uid).get("lock_password")
+            if not default_pw:
+                sess2['awaiting_full_lock_password'] = True
+                sess2['full_pipeline_pending'] = {"pages_spec": 'none', "chat_id": query.message.chat.id, "batch": True}
+                await safe_edit_message(query, "🔐 Send password to lock PDF (or 'skip' to send without lock).")
+                return
+            await run_full_pipeline_batch_and_send(client, query.message.chat.id, uid, pw, pages_spec='none', lock_pw=default_pw)
+            return
+        await run_full_pipeline_and_send(client, query.message.chat.id, uid, pw, pages_spec='none')
+        return
+    elif data.startswith("full_manual:"):
+        uid = int(data.split(":")[1])
+        if query.from_user.id != uid:
+            await query.answer("❌ This is not for you!", show_alert=True)
+            return
+        sess2 = ensure_session_dict(uid)
+        sess2.pop('awaiting_both_pages', None)
+        sess2["awaiting_full_manual_pages"] = True
+        logger.info("[fullproc_select] user=%s pages=manual (awaiting input)", uid)
+        await query.message.reply_text("✏️ Send pages to remove (e.g. 1,3-5). Send 'none' to keep all pages.")
+        return
+
+    # ==== /pdf_edit page selection handlers ====
+    elif data.startswith("edit_first:"):
+        uid = int(data.split(":")[1])
+        if query.from_user.id != uid:
+            await query.answer("❌ This is not for you!", show_alert=True)
+            return
+        sess2 = ensure_session_dict(uid)
+        sess2["awaiting_pdf_edit_pages"] = False
+        await _pdf_edit_apply_pages_and_continue(client, uid, query.message.chat.id, "first")
+        return
+    elif data.startswith("edit_last:"):
+        uid = int(data.split(":")[1])
+        if query.from_user.id != uid:
+            await query.answer("❌ This is not for you!", show_alert=True)
+            return
+        sess2 = ensure_session_dict(uid)
+        sess2["awaiting_pdf_edit_pages"] = False
+        await _pdf_edit_apply_pages_and_continue(client, uid, query.message.chat.id, "last")
+        return
+    elif data.startswith("edit_middle:"):
+        uid = int(data.split(":")[1])
+        if query.from_user.id != uid:
+            await query.answer("❌ This is not for you!", show_alert=True)
+            return
+        sess2 = ensure_session_dict(uid)
+        sess2["awaiting_pdf_edit_pages"] = False
+        await _pdf_edit_apply_pages_and_continue(client, uid, query.message.chat.id, "middle")
+        return
+    elif data.startswith("edit_manual:"):
+        uid = int(data.split(":")[1])
+        if query.from_user.id != uid:
+            await query.answer("❌ This is not for you!", show_alert=True)
+            return
+        sess2 = ensure_session_dict(uid)
+        sess2["awaiting_pdf_edit_pages"] = True
+        await query.message.reply_text("✏️ Send pages to remove (e.g. 1,3-5). Send 'none' to keep all pages.")
         return
 
 @app.on_message(filters.text & filters.private)
@@ -2277,11 +2894,24 @@ async def handle_all_text(client, message: Message):
     # Short-circuit commands that might not be caught in some environments
     if message.text:
         txt = message.text.strip().lower()
+        # Fallbacks for commands in case some environments miss command handlers
+        if txt.startswith("/setbanied") or txt.startswith("/setbaneid"):
+            await cmd_setbanied(client, message)
+            return
         if txt.startswith("/setbanner"):
             await cmd_setbanner(client, message)
             return
         if txt.startswith("/view_banner") or txt.startswith("/viewbanner"):
             await cmd_view_banner(client, message)
+            return
+        if txt.startswith("/viewbanied"):
+            await cmd_viewbanied(client, message)
+            return
+        if txt.startswith("/donebanied"):
+            await cmd_donebanied(client, message)
+            return
+        if txt.startswith("/deletebanied"):
+            await cmd_deletebanied(client, message)
             return
         if txt.startswith("/setpassword"):
             await cmd_setpassword(client, message)
@@ -2352,6 +2982,30 @@ async def handle_all_text(client, message: Message):
         await process_unlock(client, message, session, password)
         # Remet à zéro le flag
         session.pop('action', None)
+        return
+
+    # Batch UNLOCK - receive password
+    if session.get('awaiting_batch_password'):
+        password = message.text.strip()
+        session.pop('awaiting_batch_password', None)
+        # Delete user's message for privacy
+        try:
+            await message.delete()
+        except:
+            pass
+        await process_batch_unlock(client, message, user_id, password)
+        return
+
+    # Batch LOCK - receive password
+    if session.get('awaiting_batch_lock_password'):
+        lock_pw = message.text.strip()
+        session.pop('awaiting_batch_lock_password', None)
+        # Delete user's message for privacy
+        try:
+            await message.delete()
+        except:
+            pass
+        await process_batch_lock(client, message, user_id, lock_pw)
         return
 
     # Gestion du renommage de vidéo
@@ -2434,93 +3088,50 @@ async def handle_all_text(client, message: Message):
     if session.get("awaiting_both_manual_page"):
         page_str = message.text.strip()
         try:
-            page_num = int(page_str) - 1  # User enters 1-based, convert to 0-based
+            page_num = int(page_str)  # Keep 1-based for unified logic
             file_id = session.get('file_id')
             if not file_id:
                 await message.reply_text("❌ No PDF in session.")
             else:
-                file_path = await client.download_media(file_id, file_name=f"{get_user_temp_dir(user_id)}/both_temp.pdf")
-                if is_pdf_locked(file_path):
-                    await message.reply_text("❌ Cannot delete page (PDF is locked).")
-                else:
-                    await delete_page_from_pdf(user_id, file_path, page_num, message)
+                # Use unified removal logic; it will handle locks and bounds
+                await remove_page_logic(client, message, user_id, page_num)
         except ValueError:
             await message.reply_text("⚠️ Invalid page number.")
         session["awaiting_both_manual_page"] = False
         return
 
-    # Gestion batch
-    if session.get('awaiting_batch_password'):
-        password = message.text.strip()
-        await process_batch_unlock(client, message, user_id, password)
-        return
-    
-    if session.get('batch_action') == 'pages' and 'awaiting_batch_password' not in session:
-        pages_text = message.text.strip()
-        await process_batch_pages(client, message, user_id, pages_text)
-        return
-    
+    # Batch 'The Both' - Step 1: receive password
     if session.get('awaiting_batch_both_password'):
         password = message.text.strip()
-        logger.info(f"🔑 DEBUG: User {user_id} entered password for batch_both")
-        logger.info(f"🔑 DEBUG: Password length: {len(password)}")
-        
-        # IMPORTANT: Ensure session exists before storing password
-        session = ensure_session_dict(user_id)
         session['batch_both_password'] = password
-        session['awaiting_batch_both_password'] = False
-        
-        # Verify immediately that password is stored correctly
-        stored_password = session.get('batch_both_password', '')
-        logger.info(f"🔑 DEBUG: Password stored successfully? {bool(stored_password)}")
-        logger.info(f"🔑 DEBUG: Session keys after storing: {list(session.keys())}")
-        
-        # Log session change
-        log_session_change(user_id, "SET", "batch_both_password", password)
-        
-        # Afficher le clavier pour la sélection des pages
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("The First", callback_data=f"batch_both_first:{user_id}"),
-                InlineKeyboardButton("The Last", callback_data=f"batch_both_last:{user_id}"),
-                InlineKeyboardButton("The Middle", callback_data=f"batch_both_middle:{user_id}")
-            ],
-            [InlineKeyboardButton("📝 Enter manually", callback_data=f"batch_both_manual:{user_id}")]
-        ])
-        await client.send_message(
-            message.chat.id,
-            "✅ Password received!\n\n"
-            "**Step 2/2:** Choose pages to remove:",
-            reply_markup=keyboard
-        )
-        sessions[user_id]['processing'] = False  # Libérer le flag pour les boutons batch
-        return
-    
-    if session.get('batch_action') == 'both' and session.get('batch_both_password'):
-        pages_text = message.text.strip()
-        await process_batch_both(client, message, user_id, session['batch_both_password'], pages_text)
-        return
-    
-    # Gestion de la saisie manuelle des pages pour batch both
-    if session.get('awaiting_batch_both_pages'):
-        pages_text = message.text.strip()
-        password = session.get('batch_both_password', '')
-        if password:
-            await process_batch_both(client, message, user_id, password, pages_text)
-        else:
-            await client.send_message(message.chat.id, "❌ Error: missing password")
+        session.pop('awaiting_batch_both_password', None)
+        # Delete user's message for privacy
+        try:
+            await message.delete()
+        except:
+            pass
+        # Ask for page selection with unified buttons
+        try:
+            await client.send_message(
+                message.chat.id,
+                "Step 2/2: Select pages to remove for all PDFs (or choose manual).",
+                reply_markup=get_batch_both_pages_buttons(user_id)
+            )
+        except Exception as e:
+            logger.error(f"Error showing batch both pages buttons: {e}")
+            await client.send_message(message.chat.id, "Send pages to remove like 1,3-5 or 'none'.")
+            session['awaiting_batch_both_pages'] = True
         return
 
-    # Gestion de la saisie manuelle de numéro de page pour suppression simple
-    if session.get('awaiting_page_number'):
-        try:
-            page_number = int(message.text.strip())
-            session['awaiting_page_number'] = False
-            await remove_page_logic(client, message, user_id, page_number)
-        except ValueError:
-            await message.reply("❌ Please enter a valid number.")
-        except Exception as e:
-            await message.reply(f"❌ Error: {e}")
+    # Batch 'The Both' - Step 2: manual pages entry
+    if session.get('awaiting_batch_both_pages'):
+        pages_text = message.text.strip()
+        session['awaiting_batch_both_pages'] = False
+        password = session.get('batch_both_password', '')
+        if not password:
+            await client.send_message(message.chat.id, "❌ Missing password. Please restart with /process → Batch → The Both.")
+            return
+        await process_batch_both(client, message, user_id, password, pages_text)
         return
 
     # Gestion username/hashtag (paramètre)
@@ -2558,6 +3169,8 @@ async def handle_all_text(client, message: Message):
     if session.get('awaiting_both_password'):
         password = message.text.strip()
         session['both_password'] = password
+        # Mirror into full_password so full_* buttons work in this flow
+        session['full_password'] = password
         session.pop('awaiting_both_password', None)
         session['awaiting_both_pages'] = True
         
@@ -2567,105 +3180,122 @@ async def handle_all_text(client, message: Message):
         except:
             pass
         
-        await client.send_message(
-            message.chat.id, 
-            "✅ Password noted. Now send the pages to remove (e.g. `1,3-5`):"
-        )
+        # Show quick selection buttons under the prompt
+        try:
+            await client.send_message(
+                message.chat.id,
+                "✅ Password noted. Now send the pages to remove (e.g. `1,3-5`):",
+                reply_markup=get_full_pages_buttons(user_id)
+            )
+        except Exception as e:
+            logger.warning(f"Couldn't attach full pages buttons: {e}")
+            await client.send_message(
+                message.chat.id,
+                "✅ Password noted. Now send the pages to remove (e.g. `1,3-5`):"
+            )
         return
 
     # Étape 2: Réception des pages et traitement final
     elif session.get('awaiting_both_pages'):
         pages_text = message.text.strip()
         pages_to_remove, error = parse_pages_text(pages_text)
-        
         if error:
             await client.send_message(message.chat.id, f"❌ {error}")
             return
-        
-        # Supprimer le message de l'utilisateur
+
+        # Delete user's message for privacy
         try:
             await message.delete()
         except:
             pass
-        
-        # Récupérer les données nécessaires
-        password = session.get('both_password', '')
-        file_id = session.get('file_id')
-        file_name = session.get('file_name')
-        username = session.get('username', '')
-        
-        if not file_id or not file_name:
-            await client.send_message(message.chat.id, "❌ Error: missing file data")
-            sessions.pop(user_id, None)
+
+        # Validate file presence
+        if not session.get('file_id'):
+            await client.send_message(message.chat.id, "❌ No file in session. Send a PDF first.")
+            # Clean flags
+            session.pop('awaiting_both_pages', None)
+            session.pop('both_password', None)
             return
-        
-        # Traitement du PDF
+
+        # Gather unlock password and run unified full pipeline
+        password = session.get('both_password', '')
+        # Clear both-specific flags before launching pipeline
+        session.pop('awaiting_both_pages', None)
+        session.pop('both_password', None)
+        await run_full_pipeline_and_send(client, message.chat.id, user_id, unlock_pw=password, pages_spec=pages_text, lock_pw=None)
+        return
+
+    # ⚡ FULL PROCESS - Step 1: receive unlock password
+    if session.get('awaiting_full_password'):
+        logger.info(f"[fullproc] Received unlock password for user %s", user_id)
+        unlock_pw = message.text.strip()
+        session['full_password'] = unlock_pw
+        session.pop('awaiting_full_password', None)
+        # Delete user's message for privacy
         try:
-            # Message de traitement en cours
-            processing_msg = await client.send_message(message.chat.id, "⏳ Processing in progress, please wait...")
-            
-            file = await client.download_media(file_id, file_name=f"{get_user_temp_dir(user_id)}/input.pdf")
-            
-            with tempfile.TemporaryDirectory() as temp_dir:
-                input_path = Path(temp_dir) / "input.pdf"
-                output_path = Path(temp_dir) / f"both_{file_name}"
-                shutil.move(file, input_path)
-                
-                with pikepdf.open(input_path, password=password if password.lower() != 'none' else '', allow_overwriting_input=True) as pdf:
-                    total_pages = len(pdf.pages)
-                    
-                    pages_to_keep = [p for i, p in enumerate(pdf.pages) if (i + 1) not in pages_to_remove]
-                    
-                    if not pages_to_keep:
-                        await processing_msg.edit_text("❌ No pages remaining after removal.")
-                        sessions.pop(user_id, None)
-                        return
-                        
-                    new_pdf = pikepdf.new()
-                    for page in pages_to_keep:
-                        new_pdf.pages.append(page)
-                        
-                    new_pdf.save(output_path)
-                
-                # Nettoyer le nom du fichier
-                cleaned_name = build_final_filename(user_id, file_name)
-                
-                # Envoyer le fichier AVANT le message de succès
-                delay = session.get('delete_delay', AUTO_DELETE_DELAY)
-                await send_and_delete(client, message.chat.id, output_path, cleaned_name, delay_seconds=delay)
-                
-                # Envoyer le message de succès APRÈS le fichier
-                await client.send_message(
-                    message.chat.id,
-                    f"✅ The Both completed successfully!\n\n"
-                    f"• PDF unlocked\n"
-                    f"• Pages {pages_text} removed\n"
-                    f"• Usernames cleaned\n"
-                    f"• Custom username added: {username if username else 'None'}"
-                )
-                
-                # Supprimer le message de traitement
-                try:
-                    await processing_msg.delete()
-                except:
-                    pass
-                        
+            await message.delete()
+        except:
+            pass
+        # Ask for page selection
+        try:
+            await client.send_message(
+                message.chat.id,
+                "Step 2/2: Select pages to remove (or choose manual).",
+                reply_markup=get_full_pages_buttons(user_id)
+            )
+            logger.info(f"[fullproc] Page selection UI shown for user %s", user_id)
         except Exception as e:
-            logger.error(f"Error process_both_final: {e}")
-            try:
-                await processing_msg.edit_text("❌ Error processing PDF")
-            except:
-                await client.send_message(message.chat.id, "❌ Error processing PDF")
-        finally:
-            # Nettoyer tout à la fin
-            user_batches[user_id].clear()
-            session = ensure_session_dict(user_id)
-            session.pop('batch_mode', None)
-            session.pop('batch_action', None)
-            session.pop('awaiting_batch_password', None)
-            session['processing'] = False
-            # IMPORTANT: Supprimer complètement la session
-            sessions.pop(user_id, None)
+            logger.error(f"Error showing full pages buttons: {e}")
+            await client.send_message(message.chat.id, "Send pages to remove like 1,3-5 or 'none'.")
+            session['awaiting_full_manual_pages'] = True
+        return
+
+    # ⚡ FULL PROCESS - Manual pages entry
+    if session.get('awaiting_full_manual_pages'):
+        logger.info(f"[fullproc] Manual pages received for user %s", user_id)
+        pages_spec = message.text.strip()
+        session['awaiting_full_manual_pages'] = False
+        # Delete user's message
+        try:
+            await message.delete()
+        except:
+            pass
+        pw = session.get('full_password', '')
+        # If batch fullproc, handle lock pw once then process all
+        if session.get('fullproc_is_batch'):
+            default_pw = get_user_pdf_settings(user_id).get("lock_password")
+            if not default_pw:
+                session['awaiting_full_lock_password'] = True
+                session['full_pipeline_pending'] = {"pages_spec": pages_spec, "chat_id": message.chat.id, "batch": True}
+                await client.send_message(message.chat.id, "🔐 Send password to lock PDF (or 'skip' to send without lock).")
+                return
+            await run_full_pipeline_batch_and_send(client, message.chat.id, user_id, pw, pages_spec=pages_spec, lock_pw=default_pw)
+            return
+        await run_full_pipeline_and_send(client, message.chat.id, user_id, pw, pages_spec=pages_spec)
+        return
+
+    # ⚡ FULL PROCESS - Awaiting lock password (triggered if no default)
+    if session.get('awaiting_full_lock_password'):
+        logger.info(f"[fullproc] Lock password received for user %s", user_id)
+        session['awaiting_full_lock_password'] = False
+        lock_pw = message.text.strip()
+        # Delete user's message for privacy
+        try:
+            await message.delete()
+        except:
+            pass
+        pending = session.pop('full_pipeline_pending', None) or {}
+        pages_spec = pending.get('pages_spec', 'none')
+        chat_id = pending.get('chat_id', message.chat.id)
+        pw = session.get('full_password', '')
+        # Normalize skip/none values
+        if str(lock_pw).strip().lower() in {"skip", "none", "no"}:
+            lock_pw = None
+        # If pending batch flag, process all; otherwise just the current file
+        if pending.get('batch'):
+            await run_full_pipeline_batch_and_send(client, chat_id, user_id, pw, pages_spec=pages_spec, lock_pw=lock_pw)
+        else:
+            await run_full_pipeline_and_send(client, chat_id, user_id, pw, pages_spec=pages_spec, lock_pw=lock_pw)
         return
 
     # Gestion du mot de passe pour suppression de pages
@@ -2704,7 +3334,7 @@ async def process_batch_unlock(client, message, user_id, password):
             await message.edit_message_text("❌ No PDF files in batch")
         else:
             await client.send_message(message.chat.id, "❌ No PDF files in batch")
-        sessions[user_id]['processing'] = False
+        clear_processing_flag(user_id, source="batch_unlock", reason="no_pdfs")
         return
     
     # Récupérer le username depuis la session
@@ -2730,6 +3360,21 @@ async def process_batch_unlock(client, message, user_id, password):
                     
                     with pikepdf.open(input_path, password=password if password.lower() != 'none' else '', allow_overwriting_input=True) as pdf:
                         pdf.save(output_path)
+                    # Multi-banner cleaning (async offload with timeout)
+                    try:
+                        raw_bytes = Path(output_path).read_bytes()
+                        cleaned = await run_in_thread_with_timeout(
+                            clean_pdf_banners, raw_bytes, user_id, base_dir=BANIED_BASE_DIR, timeout=BANNER_CLEAN_TIMEOUT
+                        )
+                        if cleaned and isinstance(cleaned, (bytes, bytearray)) and cleaned != raw_bytes:
+                            cleaned_path = Path(temp_dir) / f"unlocked_cleaned_{file_info['file_name']}"
+                            with open(cleaned_path, "wb") as cf:
+                                cf.write(cleaned)
+                            output_path = cleaned_path
+                    except asyncio.TimeoutError as te:
+                        logger.warning(f"[batch_unlock] Cleaning timed out for user {user_id}: {te}")
+                    except Exception as e:
+                        logger.warning(f"[batch_unlock] Cleaning failed/skipped for user {user_id}: {e}")
                     
                     new_file_name = build_final_filename(user_id, file_info['file_name'])
                     delay = session.get('delete_delay', AUTO_DELETE_DELAY)
@@ -2748,54 +3393,16 @@ async def process_batch_unlock(client, message, user_id, password):
         )
         
     finally:
-        user_batches[user_id].clear()
+        clear_user_batch(user_id)
         session = ensure_session_dict(user_id)
         session.pop('batch_mode', None)
         session.pop('batch_action', None)
         session.pop('awaiting_batch_password', None)
-        session['processing'] = False
+        clear_processing_flag(user_id, source="batch_unlock", reason="completed")
 
 async def process_batch_pages(client, message, user_id, pages_text):
-    if user_id not in user_batches:
-        user_batches[user_id] = []
-    
-    files = user_batches[user_id]
-    pdf_files = [f for f in files if is_pdf_file(f['file_name'])]
-    
-    if not pdf_files:
-        if hasattr(message, 'edit_message_text'):
-            await message.edit_message_text("❌ No PDF files in batch")
-        else:
-            await client.send_message(message.chat.id, "❌ No PDF files in batch")
-        sessions[user_id]['processing'] = False
-        return
-    
-    # Parser les pages
-    pages_to_remove = set()
-    try:
-        for part in pages_text.replace(' ', '').split(','):
-            if '-' in part:
-                start, end = map(int, part.split('-'))
-                pages_to_remove.update(range(start, end + 1))
-            else:
-                pages_to_remove.add(int(part))
-    except ValueError:
-        if hasattr(message, 'edit_message_text'):
-            await message.edit_message_text("❌ Invalid format. Use: 1,3,5 or 1-5")
-        else:
-            await client.send_message(message.chat.id, "❌ Invalid format. Use: 1,3,5 or 1-5")
-        sessions[user_id]['processing'] = False
-        return
-    
-    # Récupérer le username depuis la session
-    session = ensure_session_dict(user_id)
-    username = session.get('username', '')
-    
-    logger.info(f"🔍 Start process_batch_pages - User {user_id} - Time: {datetime.now()}")
-    status = await create_or_edit_status(client, message, f"⏳ Processing {len(pdf_files)} PDF files...")
-    success_count = 0
-    error_count = 0
-    
+    # ... (rest of the code remains the same)
+
     try:
         for i, file_info in enumerate(pdf_files):
             try:
@@ -2820,6 +3427,21 @@ async def process_batch_pages(client, message, user_id, pages_text):
                             new_pdf.pages.append(page)
                             
                         new_pdf.save(output_path)
+                        # Multi-banner cleaning (async offload with timeout)
+                        try:
+                            raw_bytes = Path(output_path).read_bytes()
+                            cleaned = await run_in_thread_with_timeout(
+                                clean_pdf_banners, raw_bytes, user_id, base_dir=BANIED_BASE_DIR, timeout=BANNER_CLEAN_TIMEOUT
+                            )
+                            if cleaned and isinstance(cleaned, (bytes, bytearray)) and cleaned != raw_bytes:
+                                cleaned_path = Path(temp_dir) / f"modified_cleaned_{file_info['file_name']}"
+                                with open(cleaned_path, "wb") as cf:
+                                    cf.write(cleaned)
+                                output_path = cleaned_path
+                        except asyncio.TimeoutError as te:
+                            logger.warning(f"[batch_pages] Cleaning timed out for user {user_id}: {te}")
+                        except Exception as e:
+                            logger.warning(f"[batch_pages] Cleaning failed/skipped for user {user_id}: {e}")
                     
                     new_file_name = build_final_filename(user_id, file_info['file_name'])
                     delay = session.get('delete_delay', AUTO_DELETE_DELAY)
@@ -2838,11 +3460,11 @@ async def process_batch_pages(client, message, user_id, pages_text):
         )
         
     finally:
-        user_batches[user_id].clear()
+        clear_user_batch(user_id)
         session = ensure_session_dict(user_id)
         session.pop('batch_mode', None)
         session.pop('batch_action', None)
-        session['processing'] = False
+        clear_processing_flag(user_id, source="batch_pages", reason="completed")
 
 async def process_batch_both(client, message, user_id, password, pages_text):
     if user_id not in user_batches:
@@ -2856,7 +3478,7 @@ async def process_batch_both(client, message, user_id, password, pages_text):
             await message.edit_message_text("❌ No PDF files in batch")
         else:
             await client.send_message(message.chat.id, "❌ No PDF files in batch")
-        sessions[user_id]['processing'] = False
+        clear_processing_flag(user_id, source="batch_both", reason="no_pdfs")
         return
     
     # Parser les pages
@@ -2873,7 +3495,7 @@ async def process_batch_both(client, message, user_id, password, pages_text):
             await message.edit_message_text("❌ Invalid format. Use: 1,3,5 or 1-5")
         else:
             await client.send_message(message.chat.id, "❌ Invalid format. Use: 1,3,5 or 1-5")
-        sessions[user_id]['processing'] = False
+        clear_processing_flag(user_id, source="batch_both", reason="invalid_pages_format")
         return
     
     # Récupérer le username depuis la session
@@ -2912,854 +3534,408 @@ async def process_batch_both(client, message, user_id, password, pages_text):
                             new_pdf.pages.append(page)
                         
                         new_pdf.save(output_path)
-                    
-                    new_file_name = build_final_filename(user_id, file_info['file_name'])
-                    delay = session.get('delete_delay', AUTO_DELETE_DELAY)
-                    await send_and_delete(client, message.chat.id, output_path, new_file_name, delay_seconds=delay)
-                    
+                        # Multi-banner cleaning (async offload with timeout)
+                        try:
+                            raw_bytes = Path(output_path).read_bytes()
+                            cleaned = await run_in_thread_with_timeout(
+                                clean_pdf_banners, raw_bytes, user_id, base_dir=BANIED_BASE_DIR, timeout=BANNER_CLEAN_TIMEOUT
+                            )
+                            if cleaned and isinstance(cleaned, (bytes, bytearray)) and cleaned != raw_bytes:
+                                cleaned_path = Path(temp_dir) / f"both_cleaned_{file_info['file_name']}"
+                                with open(cleaned_path, "wb") as cf:
+                                    cf.write(cleaned)
+                                output_path = cleaned_path
+                        except asyncio.TimeoutError as te:
+                            logger.warning(f"[batch_both] Cleaning timed out for user {user_id}: {te}")
+                        except Exception as e:
+                            logger.warning(f"[batch_both] Cleaning failed/skipped for user {user_id}: {e}")
+                        
+                        new_file_name = build_final_filename(user_id, file_info['file_name'])
+                        delay = session.get('delete_delay', AUTO_DELETE_DELAY)
+                        await send_and_delete(client, message.chat.id, output_path, new_file_name, delay_seconds=delay)
+                        
                     success_count += 1
                     
             except Exception as e:
                 logger.error(f"Error batch both file {i}: {e}")
                 error_count += 1
-        
-        await status.edit_text(
-            f"✅ Combined processing complete!\n\n"
-            f"Successful: {success_count}\n"
-            f"Errors: {error_count}"
-        )
-        
+
+        # Summary after processing all files
+        try:
+            await status.edit_text(
+                f"✅ Processing complete!\n\n"
+                f"Successful: {success_count}\n"
+                f"Errors: {error_count}"
+            )
+        except Exception:
+            pass
     finally:
-        user_batches[user_id].clear()
+        # Cleanup batch and reset flags
+        clear_user_batch(user_id)
         session = ensure_session_dict(user_id)
         session.pop('batch_mode', None)
         session.pop('batch_action', None)
-        session.pop('batch_both_password', None)
-        session.pop('awaiting_batch_both_pages', None)
-        session['processing'] = False
-
-# Modification des fonctions existantes pour utiliser send_and_delete
-async def process_unlock(client, message, session, password):
-    user_id = message.from_user.id
-    
-    try:
-        await message.delete()
-    except:
-        pass
-    
-    logger.info(f"🔓 process_unlock - User {user_id} - Password length: {len(password)}")
-    
-    status = await client.send_message(message.chat.id, MESSAGES['processing'])
-    
-    try:
-        # Vérifier l'existence du fichier dans la session
-        if 'file_id' not in session:
-            await status.edit_text("❌ No file in session. Send a PDF first.")
-            return
-        
-        file = await client.download_media(session['file_id'], file_name=f"{get_user_temp_dir(user_id)}/input.pdf")
-        with tempfile.TemporaryDirectory() as temp_dir:
-            input_path = Path(temp_dir) / "input.pdf"
-            output_path = Path(temp_dir) / f"unlocked_{session['file_name']}"
-            shutil.move(file, input_path)
-            
-            with pikepdf.open(input_path, password=password if password.lower() != 'none' else '', allow_overwriting_input=True) as pdf:
-                pdf.save(output_path)
-            
-            # Nettoyer le nom du fichier
-            username = session.get('username', '')
-            cleaned_name = build_final_filename(user_id, session['file_name'])
-            
-            # Supprimer le message de statut
-            try:
-                await status.delete()
-            except:
-                pass
-            
-            # Envoyer le message de succès
-            await client.send_message(
-                message.chat.id,
-                "✅ PDF unlocked successfully!"
-            )
-            
-            # Envoyer le fichier
-            delay = session.get('delete_delay', AUTO_DELETE_DELAY)
-            await send_and_delete(client, message.chat.id, output_path, cleaned_name, delay_seconds=delay)
-                    
-    except Exception as e:
-        logger.error(f"Error process_unlock: {e}")
-        await status.edit_text(MESSAGES['error'])
-    finally:
-        # IMPORTANT: Supprimer complètement la session
-        sessions.pop(user_id, None)
-
-async def process_clean_username(client, message_or_query, session):
-    """Fonction pour nettoyer uniquement les usernames du nom de fichier"""
-    user_id = message_or_query.from_user.id if hasattr(message_or_query, 'from_user') else message_or_query.chat.id
-    
-    try:
-        # Supprimer le message de l'utilisateur si possible
-        try:
-            await message_or_query.delete()
-        except:
-            pass
-        
-        logger.info(f"🧹 process_clean_username - User {user_id}")
-        
-        status = await client.send_message(message_or_query.chat.id, MESSAGES['processing'])
-        
-        # Vérifier l'existence du fichier dans la session
-        if 'file_id' not in session:
-            await status.edit_text("❌ No file in session. Send a file first.")
-            return
-        
-        file_name = session['file_name']
-        
-        # Traitement différent selon le type de fichier
-        if is_pdf_file(file_name):
-            # Traitement PDF (existant)
-            file = await client.download_media(session['file_id'], file_name=f"{get_user_temp_dir(user_id)}/input.pdf")
-            with tempfile.TemporaryDirectory() as temp_dir:
-                input_path = Path(temp_dir) / "input.pdf"
-                output_path = Path(temp_dir) / f"cleaned_{file_name}"
-                shutil.move(file, input_path)
-                
-                with pikepdf.open(input_path, allow_overwriting_input=True) as pdf:
-                    pdf.save(output_path)
-                
-                # Nettoyer le nom du fichier
-                username = session.get('username', '')
-                cleaned_name = build_final_filename(user_id, file_name)
-                
-                # Supprimer le message de statut
-                try:
-                    await status.delete()
-                except:
-                    pass
-                
-                # Envoyer le message de succès
-                await client.send_message(
-                    message_or_query.chat.id,
-                    "✅ Usernames cleaned in filename!"
-                )
-                
-                # Envoyer le fichier
-                delay = session.get('delete_delay', AUTO_DELETE_DELAY)
-                await send_and_delete(client, message_or_query.chat.id, output_path, cleaned_name, delay_seconds=delay)
-        
-        else:
-            # Traitement vidéo (simple renommage)
-            file_path = await client.download_media(session['file_id'], file_name=f"{get_user_temp_dir(user_id)}/{file_name}")
-            
-            # Nettoyer le nom du fichier
-            username = session.get('username', '')
-            cleaned_name = build_final_filename(user_id, file_name)
-            
-            # Créer le nouveau chemin avec le nom nettoyé
-            new_path = os.path.join(get_user_temp_dir(user_id), cleaned_name)
-            shutil.move(file_path, new_path)
-            
-            # Supprimer le message de statut
-            try:
-                await status.delete()
-            except:
-                pass
-            
-            # Envoyer le message de succès
-            await client.send_message(
-                message_or_query.chat.id,
-                "✅ Usernames cleaned in filename!"
-            )
-            
-            # Envoyer le fichier
-            delay = session.get('delete_delay', AUTO_DELETE_DELAY)
-            await send_and_delete(client, message_or_query.chat.id, new_path, cleaned_name, delay_seconds=delay)
-                    
-    except Exception as e:
-        logger.error(f"Error process_clean_username: {e}")
-        await status.edit_text(MESSAGES['error'])
-    finally:
-        # IMPORTANT: Supprimer complètement la session
-        sessions.pop(user_id, None)
+        clear_processing_flag(user_id, source="batch_both", reason="completed")
 
 async def process_batch_clean(client, message, user_id):
-    # Vérifier l'existence de user_batches[user_id]
+    """Clean @username and hashtags in all PDFs in the batch and send them back."""
     if user_id not in user_batches:
         user_batches[user_id] = []
-    
+
     files = user_batches[user_id]
-    # Filtrer uniquement les PDF
     pdf_files = [f for f in files if is_pdf_file(f['file_name'])]
-    
+
     if not pdf_files:
         if hasattr(message, 'edit_message_text'):
             await message.edit_message_text("❌ No PDF files in batch")
         else:
             await client.send_message(message.chat.id, "❌ No PDF files in batch")
-        sessions[user_id]['processing'] = False
+        clear_processing_flag(user_id, source="batch_clean", reason="no_pdfs")
         return
-    
-    status = await create_or_edit_status(client, message, f"🧹 Cleaning usernames on {len(pdf_files)} files...")
+
+    session = ensure_session_dict(user_id)
+    logger.info(f"🔍 Start process_batch_clean - User {user_id} - Time: {datetime.now()}")
+    status = await create_or_edit_status(client, message, f"⏳ Cleaning {len(pdf_files)} PDF files...")
     success_count = 0
     error_count = 0
-    
+
     try:
         for i, file_info in enumerate(pdf_files):
             try:
-                await status.edit_text(f"🧹 Cleaning file {i+1}/{len(pdf_files)}...")
-                
-                file_name = file_info['file_name']
-                
-                # Traitement PDF (seulement PDF ici)
+                await status.edit_text(f"⏳ Processing file {i+1}/{len(pdf_files)}...")
 
-                
-                file = await client.download_media(file_info['file_id'], file_name=f"{get_user_temp_dir(user_id)}/batch_{i}.pdf")
+                # Download
+                file = await client.download_media(
+                    file_info['file_id'], file_name=f"{get_user_temp_dir(user_id)}/batch_{i}.pdf"
+                )
+
                 with tempfile.TemporaryDirectory() as temp_dir:
                     input_path = Path(temp_dir) / "input.pdf"
-                    output_path = Path(temp_dir) / f"cleaned_{file_name}"
+                    output_path = Path(temp_dir) / f"cleaned_{file_info['file_name']}"
                     shutil.move(file, input_path)
-                    with pikepdf.open(input_path, allow_overwriting_input=True) as pdf:
-                        pdf.save(output_path)
-                username = sessions[user_id].get('username', '')
-                cleaned_name = build_final_filename(user_id, file_name)
-                delay = sessions[user_id].get('delete_delay', AUTO_DELETE_DELAY)
-                await send_and_delete(client, message.chat.id, output_path, cleaned_name, delay_seconds=delay)
 
-                success_count += 1
+                    # Best-effort cleaning
+                    try:
+                        raw_bytes = Path(input_path).read_bytes()
+                        cleaned = await run_in_thread_with_timeout(
+                            clean_pdf_banners, raw_bytes, user_id, base_dir=BANIED_BASE_DIR, timeout=BANNER_CLEAN_TIMEOUT
+                        )
+                        if cleaned and isinstance(cleaned, (bytes, bytearray)) and cleaned != raw_bytes:
+                            with open(output_path, "wb") as cf:
+                                cf.write(cleaned)
+                        else:
+                            # No change – keep original
+                            output_path = input_path
+                    except asyncio.TimeoutError as te:
+                        logger.warning(f"[batch_clean] Cleaning timed out for user {user_id}: {te}")
+                        output_path = input_path
+                    except Exception as e:
+                        logger.warning(f"[batch_clean] Cleaning failed/skipped for user {user_id}: {e}")
+                        output_path = input_path
 
+                    new_file_name = build_final_filename(user_id, file_info['file_name'])
+                    delay = session.get('delete_delay', AUTO_DELETE_DELAY)
+                    await send_and_delete(client, message.chat.id, output_path, new_file_name, delay_seconds=delay)
+
+                    success_count += 1
             except Exception as e:
                 logger.error(f"Error batch clean file {i}: {e}")
                 error_count += 1
 
-        await status.edit_message_text(
-            f"✅ Cleaning complete!\n\n"
-            f"Successful: {success_count}\n"
-            f"Errors: {error_count}"
-        )
-
+        try:
+            await status.edit_text(
+                f"✅ Processing complete!\n\n"
+                f"Successful: {success_count}\n"
+                f"Errors: {error_count}"
+            )
+        except Exception:
+            pass
     finally:
-        user_batches[user_id].clear()
-        sessions[user_id].pop('batch_mode', None)
-        sessions[user_id]['processing'] = False
+        clear_user_batch(user_id)
+        session = ensure_session_dict(user_id)
+        session.pop('batch_mode', None)
+        session.pop('batch_action', None)
+        clear_processing_flag(user_id, source="batch_clean", reason="completed")
 
-async def process_video_batch_item(client, message, file_info, user_id):
-    """Traite une vidéo en mode batch clean - SANS TÉLÉCHARGEMENT"""
-    try:
-        file_id = file_info['file_id']
-        caption = file_info.get('caption', '')  # Caption originale
-        
-        # Utiliser la fonction unifiée pour nettoyer la caption
-        final_caption = clean_caption_with_username(caption, user_id)
-        
-        # Envoyer directement avec le file_id (pas de téléchargement!)
-        await client.send_video(
-            chat_id=message.chat.id,
-            video=file_id,  # Utilise le file_id original
-            caption=final_caption
-        )
-        
-        # Petit délai anti-flood
-        await asyncio.sleep(0.7)
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error processing video batch: {e}")
-        return False
-
-async def process_pdf_batch_item(client, message, file_info, user_id):
-    """Traite un PDF en mode batch clean"""
-    try:
-        file_name = file_info['file_name']
-        local_path = file_info.get('local_path')
-        
-        if local_path and os.path.exists(local_path):
-            with tempfile.TemporaryDirectory() as temp_dir:
-                input_path = Path(temp_dir) / "input.pdf"
-                output_path = Path(temp_dir) / f"cleaned_{file_name}"
-                shutil.copy2(local_path, input_path)
-                
-                with pikepdf.open(input_path, allow_overwriting_input=True) as pdf:
-                    pdf.save(output_path)
-                
-                # Nettoyer le nom du fichier
-                username = sessions[user_id].get('username', '')
-                cleaned_name = build_final_filename(user_id, file_name)
-                
-                delay = sessions[user_id].get('delete_delay', AUTO_DELETE_DELAY)
-                await send_and_delete(client, message.chat.id, output_path, cleaned_name, delay_seconds=delay)
-        
-            return True
-        else:
-            logger.error(f"Local PDF file not found: {local_path}")
-            return False
-            
-    except Exception as e:
-        logger.error(f"Error processing PDF batch: {e}")
-        return False
-
-async def clean_and_send_video(client, chat_id, file_id, caption, user_id, delay=AUTO_DELETE_DELAY):
-    """Fonction unifiée pour nettoyer et envoyer une vidéo"""
-    try:
-        # Nettoyer la caption et ajouter le username
-        final_caption = clean_caption_with_username(caption, user_id)
-                    
-        # Marquer qu'on traite un fichier
-        await set_just_processed_flag(user_id)
-        
-        # Envoyer la vidéo
-        sent = await client.send_video(
-            chat_id=chat_id,
-            video=file_id,
-            caption=final_caption
-        )
-        
-        # Planifier la suppression si nécessaire
-        if delay > 0:
-            async def delete_after_delay():
-                await asyncio.sleep(delay)
-                try:
-                    await sent.delete()
-                except Exception as e:
-                    logger.error(f"Error deleting video: {e}")
-            
-            asyncio.create_task(delete_after_delay())
-        
-        # Le flag est géré par set_just_processed_flag
-        pass
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error in clean_and_send_video: {e}")
-        return False
-
-async def process_batch_generic(client, message, user_id, action_func, action_name):
-    """Template générique pour le traitement batch"""
+async def process_batch_add_banner(client, message, user_id):
+    """Add configured banner to all PDFs in the batch, with pre-cleaning and final send."""
     if user_id not in user_batches:
         user_batches[user_id] = []
-    
     files = user_batches[user_id]
-    if not files:
-        await safe_edit_message(message, "❌ No files in batch")
-        sessions[user_id]['processing'] = False
+    pdf_files = [f for f in files if is_pdf_file(f['file_name'])]
+
+    if not pdf_files:
+        if hasattr(message, 'edit_message_text'):
+            await message.edit_message_text("❌ No PDF files in batch")
+        else:
+            await client.send_message(message.chat.id, "❌ No PDF files in batch")
+        clear_processing_flag(user_id, source="batch_add_banner", reason="no_pdfs")
         return
-    
-    status = await create_or_edit_status(client, message, f"⏳ Processing {len(files)} files...")
+
+    banner_pdf = _ensure_banner_pdf_path(user_id)
+    if not banner_pdf:
+        if hasattr(message, 'edit_message_text'):
+            await message.edit_message_text("❌ No default banner. Use /setbanner first.")
+        else:
+            await client.send_message(message.chat.id, "❌ No default banner. Use /setbanner first.")
+        clear_processing_flag(user_id, source="batch_add_banner", reason="no_default_banner")
+        return
+
+    session = ensure_session_dict(user_id)
+    logger.info(f"🔍 Start process_batch_add_banner - User {user_id} - Time: {datetime.now()}")
+    status = await create_or_edit_status(client, message, f"⏳ Processing {len(pdf_files)} PDF files...")
     success_count = 0
     error_count = 0
-    
+
     try:
-        for i, file_info in enumerate(files):
+        for i, file_info in enumerate(pdf_files):
             try:
-                await status.edit_text(f"⏳ {action_name} {i+1}/{len(files)}...")
-                result = await action_func(client, file_info, user_id, i)
-                if result:
-                    success_count += 1
-                else:
-                    error_count += 1
-            except Exception as e:
-                logger.error(f"Error in batch {action_name}: {e}")
-                error_count += 1
-        
-        await show_batch_results(status, success_count, error_count)
-        
-    finally:
-        user_batches[user_id].clear()
-        reset_session_flags(user_id)
-        sessions[user_id]['processing'] = False
+                await status.edit_text(f"⏳ Processing file {i+1}/{len(pdf_files)}...")
 
-async def show_batch_results(status, success_count, error_count):
-    """Affiche les résultats du traitement batch"""
-    if error_count == 0:
-        await status.edit_message_text(
-            f"✅ **Batch processing completed successfully!**\n\n"
-            f"📊 **Statistics:**\n"
-            f"• ✅ Success: {success_count} files\n"
-            f"• ❌ Errors: {error_count} files\n\n"
-            f"🎉 All files have been processed and cleaned!"
-        )
-    else:
-        await status.edit_message_text(
-            f"⚠️ **Batch processing completed with errors**\n\n"
-            f"📊 **Statistics:**\n"
-            f"• ✅ Success: {success_count} files\n"
-            f"• ❌ Errors: {error_count} files\n\n"
-            f"💡 Some files could not be processed. Please check the error messages above."
-        )
+                file = await client.download_media(file_info['file_id'], file_name=f"{get_user_temp_dir(user_id)}/batch_{i}.pdf")
 
-async def handle_session_expired_error(client, chat_id, file_type="file"):
-    """Gère les erreurs de session expirée avec un message clair"""
-    await client.send_message(
-        chat_id,
-        f"❌ **{file_type.title()} session expired**\n\n"
-        f"The {file_type} session has expired and cannot be processed.\n"
-        f"Please resend the {file_type} - it must be processed within 1-2 minutes of sending.\n\n"
-        f"This happens when {file_type}s are not processed quickly enough after being sent."
-    )
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    input_path = Path(temp_dir) / "input.pdf"
+                    output_path = Path(temp_dir) / f"bannered_{file_info['file_name']}"
+                    shutil.move(file, input_path)
 
-async def cleanup_batch_temp_files(user_id):
-    """Nettoie automatiquement tous les fichiers temporaires d'un utilisateur en mode batch"""
-    try:
-        # Nettoyer les fichiers temporaires générés pendant le traitement
-        temp_dir = get_user_temp_dir(user_id)
-        if os.path.exists(temp_dir):
-            for filename in os.listdir(temp_dir):
-                if filename.startswith('batch_') or filename.startswith('temp_'):
-                    file_path = os.path.join(temp_dir, filename)
+                    # Pre-clean banners (best-effort)
+                    cleaned_input = input_path
                     try:
-                        os.remove(file_path)
-                        logger.info(f"Cleaned up temporary file: {file_path}")
+                        raw_bytes = Path(input_path).read_bytes()
+                        cleaned = await run_in_thread_with_timeout(
+                            clean_pdf_banners, raw_bytes, user_id, base_dir=BANIED_BASE_DIR, timeout=BANNER_CLEAN_TIMEOUT
+                        )
+                        if cleaned and isinstance(cleaned, (bytes, bytearray)) and cleaned:
+                            cleaned_path = Path(temp_dir) / "input_cleaned.pdf"
+                            with open(cleaned_path, "wb") as cf:
+                                cf.write(cleaned)
+                            cleaned_input = cleaned_path
+                    except asyncio.TimeoutError as te:
+                        logger.warning(f"[batch_add_banner] Cleaning timed out for user {user_id}: {te}")
                     except Exception as e:
-                        logger.error(f"Error deleting temporary file {file_path}: {e}")
-                        
-    except Exception as e:
-        logger.error(f"Error in cleanup_batch_temp_files for user {user_id}: {e}")
+                        logger.warning(f"[batch_add_banner] Cleaning failed/skipped for user {user_id}: {e}")
 
-# Fonction de nettoyage périodique des fichiers temporaires
-async def cleanup_temp_files():
-    """Nettoie les fichiers temporaires plus anciens que 1 heure"""
-    while True:
+                    # Add banner pages
+                    await run_in_thread_with_timeout(
+                        add_banner_pages_to_pdf, str(cleaned_input), str(output_path), banner_pdf, place='after', timeout=BANNER_ADD_TIMEOUT
+                    )
+
+                    new_file_name = build_final_filename(user_id, file_info['file_name'])
+                    delay = session.get('delete_delay', AUTO_DELETE_DELAY)
+                    await send_and_delete(client, message.chat.id, output_path, new_file_name, delay_seconds=delay)
+
+                    success_count += 1
+            except Exception as e:
+                logger.error(f"Error batch add banner file {i}: {e}")
+                error_count += 1
+
         try:
-            current_time = datetime.now()
-            # Parcourir tous les sous-dossiers utilisateur
-            for user_dir in TEMP_DIR.iterdir():
-                if user_dir.is_dir():
-                    for file_path in user_dir.glob("*"):
-                        if file_path.is_file():
-                            file_time = datetime.fromtimestamp(file_path.stat().st_mtime)
-                            if current_time - file_time > timedelta(hours=1):
-                                file_path.unlink()
-                                logger.info(f"Temporary file deleted: {file_path}")
-                    
-                    # Supprimer le dossier utilisateur s'il est vide
-                    if not any(user_dir.iterdir()):
-                        user_dir.rmdir()
-                        logger.info(f"Empty user directory deleted: {user_dir}")
-            
-            # Nettoyer les flags processing bloqués
-            for user_id in list(sessions.keys()):
-                if sessions[user_id].get('processing'):
-                    # Vérifier si le flag est bloqué depuis trop longtemps
-                    last_activity = sessions[user_id].get('last_activity')
-                    if last_activity and (current_time - last_activity) > timedelta(minutes=5):
-                        logger.info(f"Libération du flag processing bloqué pour user {user_id}")
-                        sessions[user_id]['processing'] = False
-                
-                # Nettoyer les sessions inactives depuis plus de 10 minutes
-                last_activity = sessions[user_id].get('last_activity')
-                if last_activity and (current_time - last_activity) > timedelta(minutes=10):
-                    logger.info(f"🗑️ Session expirée pour user {user_id}")
-                    sessions.pop(user_id, None)
-                    # Nettoyer aussi les batches
-                    if user_id in user_batches:
-                        user_batches[user_id].clear()
-                        
-        except Exception as e:
-            logger.error(f"Error cleaning temp files: {e}")
-        
-        await asyncio.sleep(3600)  # Vérifier toutes les heures
+            await status.edit_text(
+                f"✅ Processing complete!\n\n"
+                f"Successful: {success_count}\n"
+                f"Errors: {error_count}"
+            )
+        except Exception:
+            pass
+    finally:
+        clear_user_batch(user_id)
+        session = ensure_session_dict(user_id)
+        session.pop('batch_mode', None)
+        session.pop('batch_action', None)
+        session.pop('awaiting_batch_lock_password', None)
+        clear_processing_flag(user_id, source="batch_add_banner", reason="completed")
 
-# 🔧 FONCTIONS UTILITAIRES PARTAGÉES 🔧
-async def process_single_pdf(input_path, output_path, password=None, pages_to_remove=None, username=""):
-    """
-    Fonction utilitaire pour traiter un PDF unique
-    Retourne: (success, error_message)
-    """
-    try:
-        with pikepdf.open(input_path, password=password if password and password.lower() != 'none' else '', allow_overwriting_input=True) as pdf:
-            # Suppression de pages si demandée
-            if pages_to_remove:
-                total_pages = len(pdf.pages)
-                invalid_pages = [p for p in pages_to_remove if p < 1 or p > total_pages]
-                if invalid_pages:
-                    return False, f"Invalid pages: {invalid_pages} (PDF has {total_pages} pages)"
-                
-                pages_to_keep = [p for i, p in enumerate(pdf.pages) if (i + 1) not in pages_to_remove]
-                
-                if not pages_to_keep:
-                    return False, "No pages remaining after removal"
-                
-                new_pdf = pikepdf.new()
-                for page in pages_to_keep:
-                    new_pdf.pages.append(page)
-                
-                new_pdf.save(output_path)
-            else:
-                # Pas de suppression, sauvegarder directement
-                pdf.save(output_path)
-            
-            return True, None
-            
-    except pikepdf.PasswordError:
-        return False, "Incorrect password"
-    except Exception as e:
-        return False, f"PDF processing error: {str(e)}"
+async def process_batch_lock(client, message, user_id, password: str):
+    """Lock all PDFs in the batch with the provided password, then send."""
+    if user_id not in user_batches:
+        user_batches[user_id] = []
 
-async def process_batch_pdfs(file_list, password=None, pages_to_remove=None, username="", temp_dir=None):
-    """
-    Fonction utilitaire pour traiter une liste de PDFs
-    Retourne: (success_count, error_count, results)
-    """
+    files = user_batches[user_id]
+    pdf_files = [f for f in files if is_pdf_file(f['file_name'])]
+
+    if not pdf_files:
+        if hasattr(message, 'edit_message_text'):
+            await message.edit_message_text("❌ No PDF files in batch")
+        else:
+            await client.send_message(message.chat.id, "❌ No PDF files in batch")
+        clear_processing_flag(user_id, source="batch_lock", reason="no_pdfs")
+        return
+
+    # Support 'default' keyword to use saved password if present
+    if password.strip().lower() == 'default':
+        password = (get_user_pdf_settings(user_id) or {}).get('lock_password')
+
+    if not password:
+        if hasattr(message, 'edit_message_text'):
+            await message.edit_message_text("❌ No password provided. Use /setpassword or send one now.")
+        else:
+            await client.send_message(message.chat.id, "❌ No password provided. Use /setpassword or send one now.")
+        clear_processing_flag(user_id, source="batch_lock", reason="no_password")
+        return
+
+    session = ensure_session_dict(user_id)
+    logger.info(f"🔍 Start process_batch_lock - User {user_id} - Time: {datetime.now()}")
+    status = await create_or_edit_status(client, message, f"⏳ Locking {len(pdf_files)} PDF files...")
     success_count = 0
     error_count = 0
-    results = []
-    
-    for i, file_info in enumerate(file_list):
-        try:
-            # Télécharger le fichier
-            file_path = await client.download_media(
-                file_info['file_id'], 
-                file_name=f"{temp_dir}/batch_{i}.pdf"
-            )
-            
-            # Traiter le PDF
-            input_path = Path(file_path)
-            output_path = Path(temp_dir) / f"processed_{file_info['file_name']}"
-            
-            success, error_msg = await process_single_pdf(
-                input_path, output_path, password, pages_to_remove, username
-            )
-            
-            if success:
-                success_count += 1
-                results.append({
-                    'success': True,
-                    'input_path': input_path,
-                    'output_path': output_path,
-                    'file_name': file_info['file_name']
-                })
-            else:
+
+    try:
+        for i, file_info in enumerate(pdf_files):
+            try:
+                await status.edit_text(f"⏳ Processing file {i+1}/{len(pdf_files)}...")
+
+                file = await client.download_media(file_info['file_id'], file_name=f"{get_user_temp_dir(user_id)}/batch_{i}.pdf")
+
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    input_path = Path(temp_dir) / "input.pdf"
+                    output_path = Path(temp_dir) / f"locked_{file_info['file_name']}"
+                    shutil.move(file, input_path)
+
+                    # Lock the PDF
+                    try:
+                        lock_pdf_with_password(str(input_path), str(output_path), password)
+                    except Exception as e:
+                        logger.error(f"[batch_lock] Error locking file {i}: {e}")
+                        error_count += 1
+                        continue
+
+                    # Optional post-clean before sending (best-effort)
+                    try:
+                        raw_bytes = Path(output_path).read_bytes()
+                        cleaned = await run_in_thread_with_timeout(
+                            clean_pdf_banners, raw_bytes, user_id, base_dir=BANIED_BASE_DIR, timeout=BANNER_CLEAN_TIMEOUT
+                        )
+                        if cleaned and isinstance(cleaned, (bytes, bytearray)) and cleaned != raw_bytes:
+                            cleaned_path = Path(temp_dir) / f"locked_cleaned_{file_info['file_name']}"
+                            with open(cleaned_path, "wb") as cf:
+                                cf.write(cleaned)
+                            output_path = cleaned_path
+                    except asyncio.TimeoutError as te:
+                        logger.warning(f"[batch_lock] Cleaning timed out for user {user_id}: {te}")
+                    except Exception as e:
+                        logger.warning(f"[batch_lock] Cleaning failed/skipped for user {user_id}: {e}")
+
+                    new_file_name = build_final_filename(user_id, file_info['file_name'])
+                    delay = session.get('delete_delay', AUTO_DELETE_DELAY)
+                    await send_and_delete(client, message.chat.id, output_path, new_file_name, delay_seconds=delay)
+
+                    success_count += 1
+            except Exception as e:
+                logger.error(f"Error batch lock file {i}: {e}")
                 error_count += 1
-                results.append({
-                    'success': False,
-                    'file_name': file_info['file_name'],
-                    'error': error_msg
-                })
-                
-        except Exception as e:
-            error_count += 1
-            results.append({
-                'success': False,
-                'file_name': file_info.get('file_name', f'file_{i}'),
-                'error': f"Download/processing error: {str(e)}"
-            })
-    
-    return success_count, error_count, results
 
-def parse_pages_text(pages_text):
-    """
-    Parse le texte des pages (ex: "1,3,5" ou "1-5")
-    Retourne: (pages_set, error_message)
-    """
-    try:
-        pages_to_remove = set()
-        for part in pages_text.replace(' ', '').split(','):
-            if '-' in part:
-                start, end = map(int, part.split('-'))
-                pages_to_remove.update(range(start, end + 1))
-            else:
-                pages_to_remove.add(int(part))
-        return pages_to_remove, None
-    except ValueError:
-        return None, "Invalid format. Use: 1,3,5 or 1-5"
-
-def ensure_session_dict(user_id):
-    """
-    S'assure que la session d'un utilisateur est un dictionnaire
-    Retourne la session (dict)
-    """
-    if user_id not in sessions:
-        sessions[user_id] = {}
-        return sessions[user_id]
-    
-    session = sessions[user_id]
-    
-    if not isinstance(session, dict):
-        logger.warning(f"⚠️ Session corrompue pour user {user_id}: {type(session)} = {session}")
-        sessions[user_id] = {}
-        return sessions[user_id]
-    
-    return session
-
-def safe_session_set(user_id, key, value):
-    """
-    Définit une valeur dans la session de manière sûre
-    """
-    session = ensure_session_dict(user_id)
-    session[key] = value
-    logger.debug(f"🔧 Session {user_id}[{key}] = {value}")
-
-def safe_session_get(user_id, key, default=None):
-    """
-    Récupère une valeur de la session de manière sûre
-    """
-    session = ensure_session_dict(user_id)
-    return session.get(key, default)
-
-def log_session_change(user_id, operation, key=None, value=None):
-    """Log les changements dans les sessions pour le débogage"""
-    session = sessions.get(user_id, {})
-    logger.info(f"📊 SESSION CHANGE - User: {user_id}")
-    logger.info(f"📊 Operation: {operation}")
-    if key:
-        logger.info(f"📊 Key: {key}")
-    if value is not None:
-        logger.info(f"📊 Value type: {type(value).__name__}")
-        if isinstance(value, str):
-            logger.info(f"📊 Value length: {len(value)}")
-    logger.info(f"📊 Current session keys: {list(session.keys())}")
-    logger.info(f"📊 Has batch_both_password: {'batch_both_password' in session}")
-
-# 🔧 EXEMPLE DE REFACTORISATION AVEC LES FONCTIONS SÛRES 🔧
-# 
-# AU LIEU DE :
-# sessions[user_id]['processing'] = True
-# sessions[user_id]['username'] = saved_username
-# 
-# UTILISER :
-# safe_session_set(user_id, 'processing', True)
-# safe_session_set(user_id, 'username', saved_username)
-# 
-# AU LIEU DE :
-# if sessions[user_id].get('username'):
-#     username = sessions[user_id]['username']
-# 
-# UTILISER :
-# username = safe_session_get(user_id, 'username')
-# if username:
-#     # utiliser username
-
-# 🔧 SYSTÈME D'ÉTATS STRUCTURÉ 🔧
-from enum import Enum
-
-class UserState(Enum):
-    IDLE = "idle"
-    AWAITING_USERNAME = "awaiting_username"
-    AWAITING_PASSWORD = "awaiting_password"
-    AWAITING_PAGES = "awaiting_pages"
-    AWAITING_BOTH_PASSWORD = "awaiting_both_password"
-    AWAITING_BOTH_PAGES = "awaiting_both_pages"
-    AWAITING_BATCH_PASSWORD = "awaiting_batch_password"
-    AWAITING_BATCH_BOTH_PASSWORD = "awaiting_batch_both_password"
-    AWAITING_BATCH_BOTH_PAGES = "awaiting_batch_both_pages"
-    PROCESSING = "processing"
-
-def set_user_state(user_id, state, **kwargs):
-    """Définit l'état d'un utilisateur avec des données supplémentaires"""
-    session = ensure_session_dict(user_id)
-    
-    session['state'] = state.value
-    session['state_data'] = kwargs
-    session['last_activity'] = datetime.now()
-    
-    logger.info(f"🔧 User {user_id} state changed to: {state.value}")
-
-def get_user_state(user_id):
-    """Récupère l'état actuel d'un utilisateur"""
-    if user_id not in sessions:
-        return UserState.IDLE, {}
-    
-    session = ensure_session_dict(user_id)
-    state_name = session.get('state', 'idle')
-    state_data = session.get('state_data', {})
-    
-    try:
-        return UserState(state_name), state_data
-    except ValueError:
-        return UserState.IDLE, {}
-
-def clear_user_state(user_id):
-    """Remet l'utilisateur à l'état IDLE"""
-    session = ensure_session_dict(user_id)
-    session['state'] = UserState.IDLE.value
-    session['state_data'] = {}
-    logger.info(f"🔧 User {user_id} state cleared to IDLE")
-
-# 🔧 EXEMPLE DE REFACTORISATION AVEC LE NOUVEAU SYSTÈME 🔧
-async def handle_text_with_states(client, message: Message):
-    """
-    Exemple de handler refactorisé utilisant le système d'états
-    """
-    user_id = message.from_user.id
-    state, state_data = get_user_state(user_id)
-    
-    logger.info(f"🔧 Handling text for user {user_id} in state: {state.value}")
-    
-    if state == UserState.IDLE:
-        # Aucune action en cours, ignorer
-        return
-    
-    elif state == UserState.AWAITING_USERNAME:
-        # Gestion de l'ajout de hashtag/tag
-        username = message.text.strip()
-        
-        # Accepter n'importe quel texte (hashtag, emoji, username, etc.)
-        if username:
-            if save_username(user_id, username):
-                await client.send_message(message.chat.id, f"✅ Tag saved: {username}")
-            else:
-                await client.send_message(message.chat.id, f"✅ Tag saved in session: {username}\n⚠️ (Could not save to file)")
-            clear_user_state(user_id)
-        else:
-            await client.send_message(message.chat.id, "❌ Please send some text to use as your tag.")
-    
-    elif state == UserState.AWAITING_PASSWORD:
-        # Gestion du mot de passe pour déverrouillage
-        password = message.text.strip()
-        file_id = state_data.get('file_id')
-        file_name = state_data.get('file_name')
-        
-        if file_id and file_name:
-            # Traiter le déverrouillage
-            await process_unlock_with_state(client, message, user_id, file_id, file_name, password)
-        else:
-            await client.send_message(message.chat.id, "❌ Error: missing file data")
-            clear_user_state(user_id)
-    
-    elif state == UserState.AWAITING_PAGES:
-        # Gestion de la saisie manuelle des pages
-        pages_text = message.text.strip()
-        pages_to_remove, error = parse_pages_text(pages_text)
-        
-        if error:
-            await client.send_message(message.chat.id, f"❌ {error}")
-            return
-        
-        file_id = state_data.get('file_id')
-        file_name = state_data.get('file_name')
-        
-        if file_id and file_name:
-            await process_pages_with_state(client, message, user_id, file_id, file_name, pages_to_remove)
-        else:
-            await client.send_message(message.chat.id, "❌ Error: missing file data")
-            clear_user_state(user_id)
-
-# Utility function for deleting a page from a PDF by index
-async def delete_page_from_pdf(user_id, file_path, page_index, reply_context):
-    try:
-        with pikepdf.open(file_path, allow_overwriting_input=True) as pdf:
-            if page_index < 0 or page_index >= len(pdf.pages):
-                await reply_context.reply_text("❌ Invalid page.")
-                return
-            pdf.pages.pop(page_index)
-            pdf.save(file_path)
-        await reply_context.reply_document(document=file_path, caption=f"✅ Page {page_index + 1} deleted.")
-    except Exception as e:
-        logger.error(f"Error deleting page: {e}")
-        await reply_context.reply_text("❌ An error occurred.")
-
-# ✅ 4. Fonction is_pdf_locked(file_path)
-def is_pdf_locked(file_path: str) -> bool:
-    try:
-        with pikepdf.open(file_path) as pdf:
-            return False  # Si on peut l'ouvrir sans mot de passe, il n'est pas verrouillé
-    except pikepdf.PasswordError:
-        return True  # Verrouillé
-    except Exception as e:
-        logger.error(f"Error is_pdf_locked: {e}")
-        return True
-
-# ✅ 5. Fonction get_last_page_number(file_path)
-def get_last_page_number(file_path: str) -> int:
-    try:
-        with pikepdf.open(file_path, allow_overwriting_input=True) as pdf:
-            return len(pdf.pages) - 1
-    except Exception as e:
-        logger.error(f"Error getting last page: {e}")
-        return 0
-
-# ✅ 6. Fonction pour créer le menu de suppression de pages
-def get_remove_pages_buttons(user_id):
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("The First", callback_data=f"both_first:{user_id}"),
-            InlineKeyboardButton("The Last", callback_data=f"both_last:{user_id}"),
-        ],
-        [
-            InlineKeyboardButton("The Middle", callback_data=f"both_middle:{user_id}"),
-            InlineKeyboardButton("Enter Manually", callback_data=f"both_manual:{user_id}"),
-        ]
-    ])
-
-# Cette fonction a été supprimée car la logique est maintenant intégrée directement dans handle_all_text
+        try:
+            await status.edit_text(
+                f"✅ Processing complete!\n\n"
+                f"Successful: {success_count}\n"
+                f"Errors: {error_count}"
+            )
+        except Exception:
+            pass
+    finally:
+        clear_user_batch(user_id)
+        session = ensure_session_dict(user_id)
+        session.pop('batch_mode', None)
+        session.pop('batch_action', None)
+        session.pop('awaiting_batch_lock_password', None)
+        clear_processing_flag(user_id, source="batch_lock", reason="completed")
 
 async def process_pages(client, message, session, pages_text):
-    """Traite la suppression de pages sans mot de passe"""
+    """Remove selected pages from a PDF without password.
+    If the PDF is protected, instruct the user to unlock first or provide a password.
+    """
     user_id = message.from_user.id
-    
+    status = None
     try:
-        # Supprimer le message de l'utilisateur
+        # Delete user's message for privacy
         try:
             await message.delete()
-        except:
+        except Exception:
             pass
-        
+
         logger.info(f"🗑️ process_pages - User {user_id}")
-        
+
         status = await client.send_message(message.chat.id, MESSAGES['processing'])
-        
-        # Vérifier l'existence du fichier dans la session
+
+        # Ensure we have a file in session
         if 'file_id' not in session:
             await status.edit_text("❌ No file in session. Send a PDF first.")
             return
-        
-        # Parser les pages
+
+        # Parse pages
         pages_to_remove, error = parse_pages_text(pages_text)
         if error:
             await status.edit_text(f"❌ {error}")
             return
-        
+
         file = await client.download_media(session['file_id'], file_name=f"{get_user_temp_dir(user_id)}/input.pdf")
         with tempfile.TemporaryDirectory() as temp_dir:
             input_path = Path(temp_dir) / "input.pdf"
             output_path = Path(temp_dir) / f"pages_{session['file_name']}"
             shutil.move(file, input_path)
-            
+
             try:
                 with pikepdf.open(input_path, allow_overwriting_input=True) as pdf:
-                    total_pages = len(pdf.pages)
                     username = session.get('username', '')
-                    
+
                     pages_to_keep = [p for i, p in enumerate(pdf.pages) if (i + 1) not in pages_to_remove]
-                    
                     if not pages_to_keep:
                         await status.edit_text("❌ No pages remaining after removal.")
                         return
-                    
+
                     new_pdf = pikepdf.new()
                     for page in pages_to_keep:
                         new_pdf.pages.append(page)
-                    
                     new_pdf.save(output_path)
+
+                    # Multi-banner cleaning (async offload with timeout)
+                    try:
+                        raw_bytes = Path(output_path).read_bytes()
+                        cleaned = await run_in_thread_with_timeout(
+                            clean_pdf_banners, raw_bytes, user_id, base_dir=BANIED_BASE_DIR, timeout=BANNER_CLEAN_TIMEOUT
+                        )
+                        if cleaned and isinstance(cleaned, (bytes, bytearray)) and cleaned != raw_bytes:
+                            cleaned_path = Path(temp_dir) / f"pages_cleaned_{session['file_name']}"
+                            with open(cleaned_path, "wb") as cf:
+                                cf.write(cleaned)
+                            output_path = cleaned_path
+                    except asyncio.TimeoutError as e:
+                        logger.warning(f"[process_pages] Banner cleaning timed out for user {user_id}: {e}")
+                    except Exception as e:
+                        logger.exception(f"[process_pages] Banner cleaning failed for user {user_id}: {e}")
             except pikepdf.PasswordError:
                 await status.edit_text("❌ PDF is protected. Please use 'Unlock' first or provide a password.")
                 return
-            
-            # Nettoyer le nom du fichier
+
+            # Build final filename
             cleaned_name = build_final_filename(user_id, session['file_name'])
-            
-            # Supprimer le message de statut
+
+            # Remove status message
             try:
                 await status.delete()
-            except:
+            except Exception:
                 pass
-            
-            # Envoyer le message de succès
+
+            # Inform success
             await client.send_message(
                 message.chat.id,
                 f"✅ Pages {pages_text} removed successfully!"
             )
-            
-            # Envoyer le fichier
+
+            # Send file
             delay = session.get('delete_delay', AUTO_DELETE_DELAY)
             await send_and_delete(client, message.chat.id, output_path, cleaned_name, delay_seconds=delay)
-                    
+
     except Exception as e:
         logger.error(f"Error process_pages: {e}")
-        await status.edit_text(MESSAGES['error'])
+        try:
+            if status:
+                await status.edit_text(MESSAGES['error'])
+        except Exception:
+            pass
     finally:
-        # IMPORTANT: Supprimer complètement la session
+        # IMPORTANT: Clear session to mirror password flow behavior
         sessions.pop(user_id, None)
 
 async def process_pages_with_password(client, message, session, password, pages_to_remove):
@@ -3804,6 +3980,21 @@ async def process_pages_with_password(client, message, session, password, pages_
                         new_pdf.pages.append(page)
                     
                     new_pdf.save(output_path)
+                    # Multi-banner cleaning (async offload with timeout)
+                    try:
+                        raw_bytes = Path(output_path).read_bytes()
+                        cleaned = await run_in_thread_with_timeout(
+                            clean_pdf_banners, raw_bytes, user_id, base_dir=BANIED_BASE_DIR, timeout=BANNER_CLEAN_TIMEOUT
+                        )
+                        if cleaned and isinstance(cleaned, (bytes, bytearray)) and cleaned != raw_bytes:
+                            cleaned_path = Path(temp_dir) / f"pages_cleaned_{session['file_name']}"
+                            with open(cleaned_path, "wb") as cf:
+                                cf.write(cleaned)
+                            output_path = cleaned_path
+                    except asyncio.TimeoutError as e:
+                        logger.warning(f"[process_pages_with_password] Banner cleaning timed out for user {user_id}: {e}")
+                    except Exception as e:
+                        logger.exception(f"[process_pages_with_password] Banner cleaning failed for user {user_id}: {e}")
             except pikepdf.PasswordError:
                 await status.edit_text("❌ Incorrect password.")
                 return
@@ -3875,7 +4066,7 @@ async def cmd_setbanner(client, message: Message):
         await send_force_join_message(client, message)
         return
     sessions.setdefault(uid, {})["awaiting_banner_upload"] = True
-    await client.send_message(message.chat.id, "🖼️ Send me your banner (image or 1-page PDF).")
+    await client.send_message(message.chat.id, "🖼️ Envoie-moi ta bannière (image ou PDF d’une page).")
 
 
 @app.on_message(filters.command(["view_banner", "viewbanner"]) & filters.private)
@@ -3888,12 +4079,12 @@ async def cmd_view_banner(client, message: Message):
         return
     bp = get_user_pdf_settings(uid).get("banner_path")
     if not bp or not os.path.exists(bp):
-        await client.send_message(message.chat.id, "ℹ️ No banner set. Use /setbanner")
+        await client.send_message(message.chat.id, "ℹ️ Aucune bannière définie. Utilise /setbanner")
         return
     if bp.lower().endswith(".pdf"):
-        await client.send_document(message.chat.id, bp, caption="📄 Banner (PDF)")
+        await client.send_document(message.chat.id, bp, caption="📄 Bannière (PDF)")
     else:
-        await client.send_photo(message.chat.id, bp, caption="🖼️ Banner (image)")
+        await client.send_photo(message.chat.id, bp, caption="🖼️ Bannière (image)")
 
 
 @app.on_message(filters.command(["setpassword"]) & filters.private)
@@ -3937,6 +4128,159 @@ async def cmd_reset_password(client, message: Message):
         return
     sessions.setdefault(uid, {})["awaiting_new_password"] = True
     await client.send_message(message.chat.id, "🔐 Send the new default password now.")
+
+
+# ===== Multi-banner management commands =====
+@app.on_message(filters.command(["setbanied", "setbaneid"]) & filters.private)
+async def cmd_setbanied(client, message: Message):
+    uid = message.from_user.id
+    # Force-join check
+    if not await is_user_in_channel(uid):
+        await send_force_join_message(client, message)
+        return
+    ensure_banied_dir(uid)
+    BANIED_ADD_MODE.add(uid)
+    await client.send_message(message.chat.id, "📨 Envoie moi le banners")
+
+
+@app.on_message(filters.command(["donebanied"]) & filters.private)
+async def cmd_donebanied(client, message: Message):
+    uid = message.from_user.id
+    # Force-join check
+    if not await is_user_in_channel(uid):
+        await send_force_join_message(client, message)
+        return
+    BANIED_ADD_MODE.discard(uid)
+    cnt = len(list_banied_images(uid))
+    await client.send_message(message.chat.id, f"✅ Mode d’ajout de bannières désactivé. Tu as {cnt} bannière(s).")
+
+
+@app.on_message(filters.command(["viewbanied"]) & filters.private)
+async def cmd_viewbanied(client, message: Message):
+    uid = message.from_user.id
+    # Force-join check
+    if not await is_user_in_channel(uid):
+        await send_force_join_message(client, message)
+        return
+    imgs = list_banied_images(uid)
+    if not imgs:
+        await client.send_message(message.chat.id, "ℹ️ Aucune bannière enregistrée. Utilise /setbanied pour en ajouter.")
+        return
+    # Send a short summary and first few images
+    await client.send_message(message.chat.id, f"🧾 Tu as {len(imgs)} bannière(s). Affichage des 5 premières…")
+    for i, p in enumerate(imgs[:5], start=1):
+        try:
+            await client.send_photo(message.chat.id, str(p), caption=f"#{i}: {p.name}")
+        except Exception:
+            try:
+                await client.send_document(message.chat.id, str(p), caption=f"#{i}: {p.name}")
+            except Exception:
+                pass
+
+
+@app.on_message(filters.command(["deletebanied"]) & filters.private)
+async def cmd_deletebanied(client, message: Message):
+    uid = message.from_user.id
+    # Force-join check
+    if not await is_user_in_channel(uid):
+        await send_force_join_message(client, message)
+        return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        # No argument: smart behavior
+        imgs = list_banied_images(uid)
+        if not imgs:
+            await client.send_message(message.chat.id, "ℹ️ Aucune bannière enregistrée. Utilise /setbanied pour en ajouter.")
+            return
+        if len(imgs) == 1:
+            # Auto-delete the only one
+            n = delete_banied(uid, 1)
+            if n:
+                await client.send_message(message.chat.id, "🗑️ Bannière #1 supprimée.")
+            else:
+                await client.send_message(message.chat.id, "❌ Échec de suppression de la bannière #1.")
+            return
+        # Multiple images: show selection keyboard
+        buttons = []
+        max_buttons = min(len(imgs), 25)
+        for i in range(1, max_buttons + 1):
+            buttons.append(InlineKeyboardButton(str(i), callback_data=f"banied_del:{i}"))
+        # Group by 5 per row
+        rows = [buttons[i:i+5] for i in range(0, len(buttons), 5)]
+        rows.append([
+            InlineKeyboardButton("All", callback_data="banied_del:all"),
+            InlineKeyboardButton("Cancel", callback_data="banied_del:cancel"),
+        ])
+        await client.send_message(
+            message.chat.id,
+            "🧹 Sélectionne la bannière à supprimer:",
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
+        return
+    arg = args[1].strip().lower()
+    if arg in {"all", "*"}:
+        n = delete_banied(uid, None)
+        await client.send_message(message.chat.id, f"🗑️ {n} bannière(s) supprimée(s).")
+        return
+    try:
+        idx = int(arg)
+    except Exception:
+        await client.send_message(message.chat.id, "❌ Index invalide. Utilise un nombre ou 'all'.")
+        return
+    n = delete_banied(uid, idx)
+    if n:
+        await client.send_message(message.chat.id, f"🗑️ Bannière #{idx} supprimée.")
+    else:
+        await client.send_message(message.chat.id, f"❌ Bannière #{idx} introuvable.")
+
+@app.on_callback_query(filters.regex(r"^banied_del:(.+)$"))
+async def cb_banied_del(client, query: CallbackQuery):
+    uid = query.from_user.id
+    # Force-join check for callbacks
+    if not await is_user_in_channel(uid):
+        try:
+            await query.answer("Please join the channel to use this.", show_alert=True)
+        except Exception:
+            pass
+        try:
+            await send_force_join_message(client, query.message)
+        except Exception:
+            pass
+        return
+    try:
+        data = query.data.split(":", 1)[1]
+    except Exception:
+        await query.answer("Invalid action", show_alert=True)
+        return
+    if data == "cancel":
+        try:
+            await query.edit_message_text("❎ Suppression annulée.")
+        except Exception:
+            pass
+        return
+    if data in {"all", "*"}:
+        n = delete_banied(uid, None)
+        try:
+            await query.edit_message_text(f"🗑️ {n} bannière(s) supprimée(s).")
+        except Exception:
+            pass
+        return
+    try:
+        idx = int(data)
+    except Exception:
+        await query.answer("Index invalide.", show_alert=True)
+        return
+    n = delete_banied(uid, idx)
+    if n:
+        try:
+            await query.edit_message_text(f"🗑️ Bannière #{idx} supprimée.")
+        except Exception:
+            pass
+    else:
+        try:
+            await query.edit_message_text(f"❌ Bannière #{idx} introuvable.")
+        except Exception:
+            pass
 
 
 @app.on_message(filters.command(["setextra_pages"]) & filters.private)
@@ -4010,11 +4354,23 @@ async def on_photo_maybe_banner(client, message: Message):
     if not await is_user_in_channel(uid):
         await send_force_join_message(client, message)
         return
+    # New: multi-banner add mode
+    if uid in BANIED_ADD_MODE:
+        try:
+            user_dir = ensure_banied_dir(uid)
+            # Use highest resolution photo
+            photo = message.photo
+            path = await client.download_media(photo.file_id, file_name=user_dir / f"banied_{int(time.time())}_{message.id}.jpg")
+            await client.send_message(message.chat.id, "✅ Bannière enregistrée pour détection.")
+        except Exception as e:
+            await client.send_message(message.chat.id, f"❌ Échec de l'enregistrement de la bannière : {e}")
+        return
     if sessions.get(uid, {}).get("awaiting_banner_upload"):
         path = await client.download_media(message.photo.file_id, file_name=BANNERS_DIR / f"banner_{uid}.jpg")
         update_user_pdf_settings(uid, banner_path=str(path))
         sessions[uid]["awaiting_banner_upload"] = False
-        await client.send_message(message.chat.id, "✅ Banner image saved.")
+        await client.send_message(message.chat.id, "✅ Image de bannière enregistrée.")
+        return
 
 
 # Hook inside existing document handler flow to accept banner file uploads
@@ -4025,6 +4381,42 @@ async def on_document_maybe_banner_or_pdf_forward(client, message: Message):
     if not await is_user_in_channel(uid):
         await send_force_join_message(client, message)
         return
+    # New: multi-banner add mode (accept images or first page of PDFs)
+    if uid in BANIED_ADD_MODE:
+        doc = message.document
+        name = (doc.file_name or "file")
+        user_dir = ensure_banied_dir(uid)
+        lower = name.lower()
+        try:
+            if (doc.mime_type or "").startswith("image/") or lower.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")):
+                await client.download_media(doc.file_id, file_name=user_dir / f"banied_{int(time.time())}_{message.id}{Path(name).suffix}")
+                await client.send_message(message.chat.id, "✅ Image de bannière enregistrée pour détection.")
+                return
+            elif lower.endswith(".pdf"):
+                # Convert first page to PNG and store
+                tmp_pdf = await client.download_media(doc.file_id, file_name=user_dir / f"_tmp_{message.id}.pdf")
+                try:
+                    if fitz is None:
+                        await client.send_message(message.chat.id, "❌ PyMuPDF manquant ; impossible de convertir le PDF en image.")
+                    else:
+                        with fitz.open(tmp_pdf) as d:
+                            if len(d) == 0:
+                                await client.send_message(message.chat.id, "❌ PDF vide.")
+                            else:
+                                p = d[0]
+                                pix = p.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                                out_path = user_dir / f"banied_{int(time.time())}_{message.id}.png"
+                                pix.save(out_path)
+                                await client.send_message(message.chat.id, "✅ Bannière enregistrée depuis la première page du PDF.")
+                finally:
+                    try:
+                        os.remove(tmp_pdf)
+                    except Exception:
+                        pass
+                return
+        except Exception as e:
+            await client.send_message(message.chat.id, f"❌ Échec de l'enregistrement de la bannière : {e}")
+            return
     if sessions.get(uid, {}).get("awaiting_banner_upload"):
         doc = message.document
         name = (doc.file_name or "banner")
@@ -4032,13 +4424,13 @@ async def on_document_maybe_banner_or_pdf_forward(client, message: Message):
             path = await client.download_media(doc.file_id, file_name=BANNERS_DIR / f"banner_{uid}{Path(name).suffix}")
             update_user_pdf_settings(uid, banner_path=str(path))
             sessions[uid]["awaiting_banner_upload"] = False
-            await client.send_message(message.chat.id, "✅ Banner image saved.")
+            await client.send_message(message.chat.id, "✅ Image de bannière enregistrée.")
             return
         elif name.lower().endswith(".pdf"):
             path = await client.download_media(doc.file_id, file_name=BANNERS_DIR / f"banner_{uid}.pdf")
             update_user_pdf_settings(uid, banner_path=str(path))
             sessions[uid]["awaiting_banner_upload"] = False
-            await client.send_message(message.chat.id, "✅ Banner PDF saved.")
+            await client.send_message(message.chat.id, "✅ PDF de bannière enregistré.")
             return
     # If not awaiting banner, fall through to original document flow handled elsewhere
 
@@ -4051,6 +4443,7 @@ def build_pdf_actions_keyboard(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔓 Unlock", callback_data=f"unlock:{user_id}")],
         [InlineKeyboardButton("🗑️ Remove pages", callback_data=f"pages:{user_id}")],
         [InlineKeyboardButton("🛠️ The Both", callback_data=f"both:{user_id}")],
+        [InlineKeyboardButton("⚡ Full Process", callback_data=f"fullproc:{user_id}")],
         [InlineKeyboardButton("🪧 Add banner", callback_data=f"add_banner:{user_id}")],
         [InlineKeyboardButton("🔐 Lock", callback_data=f"lock_now:{user_id}")],
         [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{user_id}")],
@@ -4196,7 +4589,11 @@ async def cmd_pdf_edit(client, message: Message):
             pass
         sess["pdf_edit"] = {"work": in_path}
         sess["awaiting_pdf_edit_pages"] = True
-        await client.send_message(chat_id, "🧹 Pages to remove? e.g. 1,3,5-7 — send `none` to skip.")
+        await client.send_message(
+            chat_id,
+            "🧹 Which pages do you want to remove?\n\nExamples:\n• 1 → removes page 1\n• 1,3,5 → removes pages 1, 3 and 5\n• 1-5 → removes pages 1 to 5",
+            reply_markup=get_pdf_edit_pages_buttons(uid)
+        )
     except PasswordError:
         sess["pdf_edit"] = {"work": in_path}
         sess["awaiting_pdf_edit_password"] = True
@@ -4229,38 +4626,16 @@ async def on_text_pdf_edit_flow(client, message: Message):
             return
         sess["pdf_edit"]["work"] = unlocked
         sess["awaiting_pdf_edit_pages"] = True
-        await client.send_message(chat_id, "🧹 Pages to remove? e.g. 1,3,5-7 — send `none` to skip.")
+        await client.send_message(
+            chat_id,
+            "🧹 Which pages do you want to remove?\n\nExamples:\n• 1 → removes page 1\n• 1,3,5 → removes pages 1, 3 and 5\n• 1-5 → removes pages 1 to 5",
+            reply_markup=get_pdf_edit_pages_buttons(uid)
+        )
         return
 
     if sess.get("awaiting_pdf_edit_pages"):
         sess["awaiting_pdf_edit_pages"] = False
-        pages = parse_pages_spec(message.text)
-        user_dir = get_user_temp_dir(uid)
-        cur = sess["pdf_edit"]["work"]
-        pruned = str(user_dir / "pdfedit_pruned.pdf")
-        try:
-            remove_pages_by_numbers(cur, pruned, pages)
-        except Exception as e:
-            await client.send_message(chat_id, f"❌ Error removing pages: {e}")
-            sess.pop("pdf_edit", None)
-            return
-        banner_pdf = _ensure_banner_pdf_path(uid)
-        after_banner = pruned
-        if banner_pdf:
-            after_banner = str(user_dir / "pdfedit_bannered.pdf")
-            try:
-                add_banner_pages_to_pdf(pruned, after_banner, banner_pdf, place="before")
-            except Exception as e:
-                await client.send_message(chat_id, f"❌ Error adding banner: {e}")
-                sess.pop("pdf_edit", None)
-                return
-        default_pw = get_user_pdf_settings(uid).get("lock_password")
-        if not default_pw:
-            sess["pdf_edit"]["work"] = after_banner
-            sess["awaiting_pdf_edit_lock_password"] = True
-            await client.send_message(chat_id, "🔐 Send password to lock PDF (or `skip` to send without lock).")
-            return
-        await _pdf_edit_finalize_and_send(client, uid, chat_id, after_banner, default_pw)
+        await _pdf_edit_apply_pages_and_continue(client, uid, chat_id, message.text)
         return
 
     if sess.get("awaiting_pdf_edit_lock_password"):
@@ -4277,6 +4652,274 @@ async def on_text_pdf_edit_flow(client, message: Message):
         return
 
 
+async def run_full_pipeline_and_send(client, chat_id: int, uid: int, unlock_pw: str | None, pages_spec: str, lock_pw: str | None = None):
+    """Full Process pipeline: unlock -> add banner -> remove pages -> lock -> multi-clean -> send."""
+    sess = ensure_session_dict(uid)
+    if sess.get('processing'):
+        await client.send_message(chat_id, "⚠️ Another process is running. Please wait.")
+        return
+    set_processing_flag(uid, chat_id=chat_id, source="full_pipeline")
+    logger.info("[FullPipeline] START uid=%s pages_spec='%s' unlock_pw_provided=%s", uid, str(pages_spec), bool(unlock_pw))
+    status = None
+    try:
+        status = await client.send_message(chat_id, MESSAGES['processing'])
+
+        file_id = sess.get('file_id')
+        file_name = sess.get('file_name') or 'document.pdf'
+        if not file_id:
+            await client.send_message(chat_id, "❌ No PDF in session. Send a PDF first.")
+            return
+
+        user_dir = get_user_temp_dir(uid)
+        in_path = await client.download_media(file_id, file_name=user_dir / 'full_input.pdf')
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            unlocked = str(td_path / 'unlocked.pdf')
+            # Unlock (or copy through if none)
+            logger.info("[FullPipeline] Unlock step for uid=%s", uid)
+            try:
+                with pikepdf.open(in_path, password=(unlock_pw if unlock_pw and unlock_pw.lower() != 'none' else ''), allow_overwriting_input=True) as pdf:
+                    pdf.save(unlocked)
+            except pikepdf.PasswordError:
+                await status.edit_text("❌ Incorrect password for unlocking.")
+                return
+            logger.info("[FullPipeline] Unlock OK uid=%s", uid)
+
+            # Pre-clean: remove pages that match known banner images BEFORE adding our custom banner
+            precleaned = str(td_path / 'precleaned.pdf')
+            try:
+                logger.info("[FullPipeline] Pre-clean banners uid=%s", uid)
+                raw_bytes = Path(unlocked).read_bytes()
+                cleaned_bytes = await run_in_thread_with_timeout(
+                    clean_pdf_banners, raw_bytes, uid, base_dir=BANIED_BASE_DIR, timeout=BANNER_CLEAN_TIMEOUT
+                )
+                if cleaned_bytes and isinstance(cleaned_bytes, (bytes, bytearray)):
+                    with open(precleaned, 'wb') as cf:
+                        cf.write(cleaned_bytes)
+                else:
+                    shutil.copy2(unlocked, precleaned)
+            except asyncio.TimeoutError as e:
+                logger.error(f"FullProcess preclean timeout: {e}")
+                shutil.copy2(unlocked, precleaned)
+            except Exception as e:
+                logger.error(f"FullProcess preclean error: {e}")
+                shutil.copy2(unlocked, precleaned)
+
+            # Add banner if available
+            banner_pdf = _ensure_banner_pdf_path(uid)
+            bannered = str(td_path / 'bannered.pdf')
+            try:
+                logger.info("[FullPipeline] Banner add step uid=%s", uid)
+                if banner_pdf:
+                    await run_in_thread_with_timeout(
+                        add_banner_pages_to_pdf, precleaned, bannered, banner_pdf, place='after', timeout=BANNER_ADD_TIMEOUT
+                    )
+                else:
+                    shutil.copy2(precleaned, bannered)
+            except asyncio.TimeoutError as e:
+                logger.error(f"FullProcess banner timeout: {e}")
+                shutil.copy2(precleaned, bannered)
+            except Exception as e:
+                logger.error(f"FullProcess banner error: {e}")
+                shutil.copy2(precleaned, bannered)
+
+            # Compute pages to remove
+            pages_list: list[int] = []
+            spec = (pages_spec or '').strip().lower()
+            if spec in {'first', 'last', 'middle'}:
+                try:
+                    with pikepdf.open(bannered, allow_overwriting_input=True) as pdf:
+                        n = len(pdf.pages)
+                    if n > 0:
+                        if spec == 'first':
+                            pages_list = [1]
+                        elif spec == 'last':
+                            pages_list = [n]
+                        else:  # middle
+                            pages_list = [((n + 1) // 2)]
+                except Exception as e:
+                    logger.error(f"FullProcess count pages error: {e}")
+            else:
+                pages_list = parse_pages_spec(spec)
+            logger.info("[FullPipeline] Pages computed uid=%s -> %s", uid, pages_list)
+
+            # Remove pages if any
+            paged = str(td_path / 'paged.pdf')
+            try:
+                logger.info("[FullPipeline] Remove pages step uid=%s (count=%d)", uid, len(pages_list) if pages_list else 0)
+                if pages_list:
+                    remove_pages_by_numbers(bannered, paged, pages_list)
+                else:
+                    shutil.copy2(bannered, paged)
+            except Exception as e:
+                await status.edit_text(f"❌ Error removing pages: {e}")
+                return
+
+            # Determine lock password
+            final_lock_pw = None
+            explicit = lock_pw is not None and str(lock_pw).strip() != ""
+            if explicit:
+                # User explicitly provided a value
+                if lock_pw.lower() in {"none", "skip", "no"}:
+                    final_lock_pw = None  # do not lock even if default exists
+                else:
+                    final_lock_pw = lock_pw
+            else:
+                # No explicit value provided; fall back to default if any, otherwise ask
+                default_pw = get_user_pdf_settings(uid).get("lock_password")
+                if default_pw:
+                    final_lock_pw = default_pw
+                else:
+                    # Ask user for lock password and store pending params
+                    sess['awaiting_full_lock_password'] = True
+                    sess['full_pipeline_pending'] = {"pages_spec": pages_spec, "chat_id": chat_id}
+                    await status.edit_text("🔐 Send password to lock PDF (or 'skip' to send without lock).")
+                    logger.info("[FullPipeline] Awaiting lock password uid=%s", uid)
+                    return
+
+            # Finalize (lock + multi-clean + send)
+            logger.info("[FullPipeline] Finalize step uid=%s lock=%s", uid, bool(final_lock_pw))
+            await _pdf_edit_finalize_and_send(client, uid, chat_id, paged, final_lock_pw)
+
+        try:
+            if status:
+                await status.delete()
+        except:
+            pass
+
+        await client.send_message(
+            chat_id,
+            "✅ Full Process completed!\n• Unlocked\n• Banner added\n• Pages processed\n• Locked & Cleaned"
+        )
+    except Exception as e:
+        logger.error(f"FullProcess error: {e}")
+        if status:
+            try:
+                await status.edit_text(MESSAGES['error'])
+            except:
+                pass
+    finally:
+        # Always release processing flag
+        clear_processing_flag(uid, source="full_pipeline", reason="completed")
+        logger.info("[FullPipeline] END uid=%s (processing cleared)", uid)
+        # If we're not awaiting a lock password step, clean temp full-process keys
+        if not sess.get('awaiting_full_lock_password'):
+            for k in (
+                'awaiting_full_password',
+                'awaiting_full_manual_pages',
+                'full_password',
+                'full_pipeline_pending',
+            ):
+                try:
+                    sess.pop(k, None)
+                except Exception:
+                    pass
+
+async def run_full_pipeline_batch_and_send(client, chat_id: int, uid: int, unlock_pw: str | None, pages_spec: str, lock_pw: str | None = None):
+    """Run Full Process on all PDFs in the user's batch using the provided unlock/lock passwords and page spec."""
+    sess = ensure_session_dict(uid)
+    batch = user_batches.get(uid, [])
+    if not batch:
+        await client.send_message(chat_id, "❌ No files waiting in the batch")
+        return
+    # Filter PDFs (skip videos or unsupported items)
+    pdf_items = [it for it in batch if not it.get('is_video')]
+    if not pdf_items:
+        await client.send_message(chat_id, "❌ No PDFs in the batch to process.")
+        return
+    for it in pdf_items:
+        try:
+            sess['file_id'] = it.get('file_id')
+            sess['file_name'] = it.get('file_name') or 'document.pdf'
+            await run_full_pipeline_and_send(client, chat_id, uid, unlock_pw, pages_spec, lock_pw=lock_pw)
+        except Exception as e:
+            logger.error(f"Batch FullProcess error on {it.get('file_name')}: {e}")
+            try:
+                await client.send_message(chat_id, f"❌ Error on {it.get('file_name')}: {e}")
+            except Exception:
+                pass
+    # clear batch after processing
+    clear_user_batch(uid)
+    try:
+        await client.send_message(chat_id, "✅ Batch Full Process completed for all PDFs.")
+    except Exception:
+        pass
+    # Reset batch flag for fullproc so next runs behave as single-flow unless re-triggered
+    try:
+        sess['fullproc_is_batch'] = False
+    except Exception:
+        pass
+
+
+async def _pdf_edit_apply_pages_and_continue(client, uid: int, chat_id: int, pages_spec: str):
+    """Apply page selection for /pdf_edit (supports 'first'/'last'/'middle' or manual spec),
+    then continue with banner add and lock prompt/finalization.
+    """
+    sess = ensure_session_dict(uid)
+    work = sess.get("pdf_edit", {}).get("work")
+    if not work:
+        await client.send_message(chat_id, "⚠️ Context lost. Run /pdf_edit again.")
+        return
+    user_dir = get_user_temp_dir(uid)
+    pruned = str(user_dir / "pdfedit_pruned.pdf")
+
+    # Build pages list
+    pages_list: list[int] = []
+    spec = (pages_spec or "").strip().lower()
+    if spec in {"first", "last", "middle"}:
+        try:
+            with pikepdf.open(work) as pdf:
+                n = len(pdf.pages)
+            if n > 0:
+                if spec == "first":
+                    pages_list = [1]
+                elif spec == "last":
+                    pages_list = [n]
+                else:
+                    pages_list = [((n + 1) // 2)]
+        except Exception as e:
+            await client.send_message(chat_id, f"❌ Error reading PDF: {e}")
+            return
+    else:
+        pages_list = parse_pages_spec(spec)
+
+    # Remove pages
+    try:
+        remove_pages_by_numbers(work, pruned, pages_list)
+    except Exception as e:
+        await client.send_message(chat_id, f"❌ Error removing pages: {e}")
+        sess.pop("pdf_edit", None)
+        return
+
+    # Add banner if configured
+    banner_pdf = _ensure_banner_pdf_path(uid)
+    after_banner = pruned
+    if banner_pdf:
+        after_banner = str(user_dir / "pdfedit_bannered.pdf")
+        try:
+            await run_in_thread_with_timeout(
+                add_banner_pages_to_pdf, pruned, after_banner, banner_pdf, place="after", timeout=BANNER_ADD_TIMEOUT
+            )
+        except asyncio.TimeoutError as e:
+            await client.send_message(chat_id, f"❌ Error adding banner (timeout): {e}")
+            sess.pop("pdf_edit", None)
+            return
+        except Exception as e:
+            await client.send_message(chat_id, f"❌ Error adding banner: {e}")
+            sess.pop("pdf_edit", None)
+            return
+
+    # Determine lock password
+    default_pw = get_user_pdf_settings(uid).get("lock_password")
+    if not default_pw:
+        sess["pdf_edit"]["work"] = after_banner
+        sess["awaiting_pdf_edit_lock_password"] = True
+        await client.send_message(chat_id, "🔐 Send password to lock PDF (or `skip` to send without lock).")
+        return
+    await _pdf_edit_finalize_and_send(client, uid, chat_id, after_banner, default_pw)
+
+
 async def _pdf_edit_finalize_and_send(client, uid: int, chat_id: int, input_path: str, lock_pw: str | None):
     user_dir = get_user_temp_dir(uid)
     out_path = input_path
@@ -4289,6 +4932,22 @@ async def _pdf_edit_finalize_and_send(client, uid: int, chat_id: int, input_path
             await client.send_message(chat_id, f"❌ Error locking PDF: {e}")
             sessions.get(uid, {}).pop("pdf_edit", None)
             return
+    # Multi-banner cleaning before sending (offloaded with timeout)
+    try:
+        raw_bytes = Path(out_path).read_bytes()
+        cleaned = await run_in_thread_with_timeout(
+            clean_pdf_banners, raw_bytes, uid, base_dir=BANIED_BASE_DIR, timeout=BANNER_CLEAN_TIMEOUT
+        )
+        if cleaned and isinstance(cleaned, (bytes, bytearray)) and cleaned != raw_bytes:
+            cleaned_path = str(user_dir / "pdfedit_cleaned.pdf")
+            with open(cleaned_path, "wb") as cf:
+                cf.write(cleaned)
+            out_path = cleaned_path
+    except asyncio.TimeoutError:
+        # Proceed with original out_path if cleaning times out
+        pass
+    except Exception:
+        pass
     file_name = sessions.get(uid, {}).get("file_name") or "document.pdf"
     delay = sessions.get(uid, {}).get('delete_delay', AUTO_DELETE_DELAY)
     final_name = build_final_filename(uid, Path(file_name).name)
