@@ -2757,6 +2757,13 @@ async def button_callback(client, query: CallbackQuery):
             return
         sess2 = ensure_session_dict(uid)
         sess2.pop('awaiting_both_pages', None)
+        # If we are already waiting for the lock password, ignore further page clicks to avoid spam
+        if sess2.get('awaiting_full_lock_password'):
+            try:
+                await query.answer("Waiting for lock password. Send 'skip' or a password.")
+            except Exception:
+                pass
+            return
         logger.info("[fullproc_select] user=%s pages=first", uid)
         pw = sess2.get('full_password', '')
         # If launched from batch, process the entire batch instead of single session file
@@ -2779,6 +2786,12 @@ async def button_callback(client, query: CallbackQuery):
             return
         sess2 = ensure_session_dict(uid)
         sess2.pop('awaiting_both_pages', None)
+        if sess2.get('awaiting_full_lock_password'):
+            try:
+                await query.answer("Waiting for lock password. Send 'skip' or a password.")
+            except Exception:
+                pass
+            return
         logger.info("[fullproc_select] user=%s pages=last", uid)
         pw = sess2.get('full_password', '')
         if sess2.get('fullproc_is_batch'):
@@ -2799,6 +2812,12 @@ async def button_callback(client, query: CallbackQuery):
             return
         sess2 = ensure_session_dict(uid)
         sess2.pop('awaiting_both_pages', None)
+        if sess2.get('awaiting_full_lock_password'):
+            try:
+                await query.answer("Waiting for lock password. Send 'skip' or a password.")
+            except Exception:
+                pass
+            return
         logger.info("[fullproc_select] user=%s pages=middle", uid)
         pw = sess2.get('full_password', '')
         if sess2.get('fullproc_is_batch'):
@@ -2819,6 +2838,12 @@ async def button_callback(client, query: CallbackQuery):
             return
         sess2 = ensure_session_dict(uid)
         sess2.pop('awaiting_both_pages', None)
+        if sess2.get('awaiting_full_lock_password'):
+            try:
+                await query.answer("Waiting for lock password. Send 'skip' or a password.")
+            except Exception:
+                pass
+            return
         logger.info("[fullproc_select] user=%s pages=none", uid)
         pw = sess2.get('full_password', '')
         # Run full pipeline keeping all pages (no deletion)
@@ -2840,6 +2865,13 @@ async def button_callback(client, query: CallbackQuery):
             return
         sess2 = ensure_session_dict(uid)
         sess2.pop('awaiting_both_pages', None)
+        # If we are already waiting for the lock password, ignore switching to manual pages
+        if sess2.get('awaiting_full_lock_password'):
+            try:
+                await query.answer("Waiting for lock password. Send 'skip' or a password.")
+            except Exception:
+                pass
+            return
         sess2["awaiting_full_manual_pages"] = True
         logger.info("[fullproc_select] user=%s pages=manual (awaiting input)", uid)
         await query.message.reply_text("✏️ Send pages to remove (e.g. 1,3-5). Send 'none' to keep all pages.")
