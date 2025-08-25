@@ -17,3 +17,7 @@ banners/
 *.session-journal
 __pycache__/
 .env
+
+# Ignore utils and specific user ban list directory
+utils/
+data/banied/7570539064/
