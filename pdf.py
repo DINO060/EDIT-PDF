@@ -2604,8 +2604,39 @@ async def button_callback(client, query: CallbackQuery):
         # Lock current PDF using default password
         password = get_user_pdf_settings(user_id).get('lock_password')
         if not password:
-            await query.edit_message_text("❌ No password set. Use /setpassword first.")
-            clear_processing_flag(user_id, source="lock_now", reason="no_password_configured")
+            # Proceed without locking: download and send the original file
+            await query.edit_message_text("ℹ️ No default password set — sending without lock.")
+            session3 = ensure_session_dict(user_id)
+            file_id3 = session3.get('file_id')
+            file_name3 = session3.get('file_name') or 'document.pdf'
+            user_dir3 = get_user_temp_dir(user_id)
+            in_path3 = await client.download_media(file_id3, file_name=user_dir3 / 'lock_input.pdf')
+            status_msg = await client.send_message(query.message.chat.id, MESSAGES['processing'])
+            try:
+                delay3 = session3.get('delete_delay', AUTO_DELETE_DELAY)
+                await send_and_delete(
+                    client,
+                    query.message.chat.id,
+                    in_path3,
+                    build_final_filename(user_id, file_name3),
+                    delay_seconds=delay3,
+                )
+                try:
+                    await status_msg.delete()
+                except:
+                    pass
+                await query.edit_message_text("✅ Sent without lock.")
+                # Clear any processing/session flags now that we're done
+                try:
+                    clear_processing_flag(user_id, source="lock_now", reason="sent_without_lock")
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    await status_msg.delete()
+                except:
+                    pass
+                await query.edit_message_text(f"❌ Error sending PDF: {e}")
             return
         session3 = ensure_session_dict(user_id)
         file_id3 = session3.get('file_id')
@@ -2770,10 +2801,12 @@ async def button_callback(client, query: CallbackQuery):
         if sess2.get('fullproc_is_batch'):
             default_pw = get_user_pdf_settings(uid).get("lock_password")
             if not default_pw:
-                # Ask once for lock password, then run batch
-                sess2['awaiting_full_lock_password'] = True
-                sess2['full_pipeline_pending'] = {"pages_spec": 'first', "chat_id": query.message.chat.id, "batch": True}
-                await safe_edit_message(query, "🔐 Send password to lock PDF (or 'skip' to send without lock).")
+                # No default password -> proceed without locking
+                try:
+                    await safe_edit_message(query, "ℹ️ No default password set — proceeding without lock.")
+                except Exception:
+                    pass
+                await run_full_pipeline_batch_and_send(client, query.message.chat.id, uid, pw, pages_spec='first', lock_pw=None)
                 return
             await run_full_pipeline_batch_and_send(client, query.message.chat.id, uid, pw, pages_spec='first', lock_pw=default_pw)
             return
@@ -2797,9 +2830,11 @@ async def button_callback(client, query: CallbackQuery):
         if sess2.get('fullproc_is_batch'):
             default_pw = get_user_pdf_settings(uid).get("lock_password")
             if not default_pw:
-                sess2['awaiting_full_lock_password'] = True
-                sess2['full_pipeline_pending'] = {"pages_spec": 'last', "chat_id": query.message.chat.id, "batch": True}
-                await safe_edit_message(query, "🔐 Send password to lock PDF (or 'skip' to send without lock).")
+                try:
+                    await safe_edit_message(query, "ℹ️ No default password set — proceeding without lock.")
+                except Exception:
+                    pass
+                await run_full_pipeline_batch_and_send(client, query.message.chat.id, uid, pw, pages_spec='last', lock_pw=None)
                 return
             await run_full_pipeline_batch_and_send(client, query.message.chat.id, uid, pw, pages_spec='last', lock_pw=default_pw)
             return
@@ -2823,9 +2858,11 @@ async def button_callback(client, query: CallbackQuery):
         if sess2.get('fullproc_is_batch'):
             default_pw = get_user_pdf_settings(uid).get("lock_password")
             if not default_pw:
-                sess2['awaiting_full_lock_password'] = True
-                sess2['full_pipeline_pending'] = {"pages_spec": 'middle', "chat_id": query.message.chat.id, "batch": True}
-                await safe_edit_message(query, "🔐 Send password to lock PDF (or 'skip' to send without lock).")
+                try:
+                    await safe_edit_message(query, "ℹ️ No default password set — proceeding without lock.")
+                except Exception:
+                    pass
+                await run_full_pipeline_batch_and_send(client, query.message.chat.id, uid, pw, pages_spec='middle', lock_pw=None)
                 return
             await run_full_pipeline_batch_and_send(client, query.message.chat.id, uid, pw, pages_spec='middle', lock_pw=default_pw)
             return
@@ -2850,9 +2887,11 @@ async def button_callback(client, query: CallbackQuery):
         if sess2.get('fullproc_is_batch'):
             default_pw = get_user_pdf_settings(uid).get("lock_password")
             if not default_pw:
-                sess2['awaiting_full_lock_password'] = True
-                sess2['full_pipeline_pending'] = {"pages_spec": 'none', "chat_id": query.message.chat.id, "batch": True}
-                await safe_edit_message(query, "🔐 Send password to lock PDF (or 'skip' to send without lock).")
+                try:
+                    await safe_edit_message(query, "ℹ️ No default password set — proceeding without lock.")
+                except Exception:
+                    pass
+                await run_full_pipeline_batch_and_send(client, query.message.chat.id, uid, pw, pages_spec='none', lock_pw=None)
                 return
             await run_full_pipeline_batch_and_send(client, query.message.chat.id, uid, pw, pages_spec='none', lock_pw=default_pw)
             return
@@ -3297,9 +3336,12 @@ async def handle_all_text(client, message: Message):
         if session.get('fullproc_is_batch'):
             default_pw = get_user_pdf_settings(user_id).get("lock_password")
             if not default_pw:
-                session['awaiting_full_lock_password'] = True
-                session['full_pipeline_pending'] = {"pages_spec": pages_spec, "chat_id": message.chat.id, "batch": True}
-                await client.send_message(message.chat.id, "🔐 Send password to lock PDF (or 'skip' to send without lock).")
+                # Auto-continue without locking when no default password is set
+                try:
+                    await client.send_message(message.chat.id, "ℹ️ No default password set — proceeding without lock.")
+                except Exception:
+                    pass
+                await run_full_pipeline_batch_and_send(client, message.chat.id, user_id, pw, pages_spec=pages_spec, lock_pw=None)
                 return
             await run_full_pipeline_batch_and_send(client, message.chat.id, user_id, pw, pages_spec=pages_spec, lock_pw=default_pw)
             return
@@ -3798,13 +3840,14 @@ async def process_batch_lock(client, message, user_id, password: str):
     if password.strip().lower() == 'default':
         password = (get_user_pdf_settings(user_id) or {}).get('lock_password')
 
+    skip_lock = False
     if not password:
+        skip_lock = True
+        # Inform and continue without locking
         if hasattr(message, 'edit_message_text'):
-            await message.edit_message_text("❌ No password provided. Use /setpassword or send one now.")
+            await message.edit_message_text("ℹ️ No password provided — proceeding without lock.")
         else:
-            await client.send_message(message.chat.id, "❌ No password provided. Use /setpassword or send one now.")
-        clear_processing_flag(user_id, source="batch_lock", reason="no_password")
-        return
+            await client.send_message(message.chat.id, "ℹ️ No password provided — proceeding without lock.")
 
     session = ensure_session_dict(user_id)
     logger.info(f"🔍 Start process_batch_lock - User {user_id} - Time: {datetime.now()}")
@@ -3824,9 +3867,12 @@ async def process_batch_lock(client, message, user_id, password: str):
                     output_path = Path(temp_dir) / f"locked_{file_info['file_name']}"
                     shutil.move(file, input_path)
 
-                    # Lock the PDF
+                    # Lock the PDF (or skip locking if no password)
                     try:
-                        lock_pdf_with_password(str(input_path), str(output_path), password)
+                        if not skip_lock:
+                            lock_pdf_with_password(str(input_path), str(output_path), password)
+                        else:
+                            shutil.copy(str(input_path), str(output_path))
                     except Exception as e:
                         logger.error(f"[batch_lock] Error locking file {i}: {e}")
                         error_count += 1
