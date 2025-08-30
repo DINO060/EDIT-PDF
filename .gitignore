@@ -1,0 +1,19 @@
+# Ignorer fichiers de config et de session
+config.py
+usernames.json
+pdf_settings.json
+force_join_channels.json
+*.session
+bot_data.sqlite3
+bot_data.sqlite3-*
+*.sqlite3
+
+# Dossiers temporaires
+__pycache__/
+downloads/
+temp_files/
+banners/
+*.session
+*.session-journal
+__pycache__/
+.env

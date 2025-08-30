@@ -1,0 +1,23 @@
+# Core dependencies
+pyrogram>=2.0.0
+tgcrypto>=1.2.0
+
+# PDF processing
+pikepdf>=8.0.0
+PyMuPDF>=1.23.0
+
+# Image processing
+Pillow>=9.0.0
+numpy>=1.21.0
+
+# Optional: OpenCV for advanced image detection (template matching)
+opencv-python>=4.5.0
+
+# Optional: For better performance with large PDFs
+concurrent-futures>=3.1.0
+
+# System monitoring
+psutil>=5.8.0
+
+# Optional: For better performance
+uvloop>=0.16.0
