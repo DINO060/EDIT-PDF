@@ -248,6 +248,8 @@ MESSAGES = {
         "/setpassword - Set default lock password\n"
         "/reset_password - Change default lock password\n"
         "/setextra_pages - Extract a page as image\n"
+        "/deletebanner - Delete or list saved banners\n"
+        "/cancel - Cancel all running tasks\n"
         
         "/pdf_edit - Full Process pipeline (unlock → remove pages → add banner → lock)\n"
         "/addfsub - Add forced-subscription channels (admin)\n"
