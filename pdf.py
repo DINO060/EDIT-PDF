@@ -878,7 +878,7 @@ user_last_command = {}  # {user_id: (command, timestamp)}
 user_actions = {}  # Pour le rate limiting
 
 def check_rate_limit(user_id):
-    """Vérifie si l'utilisateur n'abuse pas"""
+    """Checks if the user is not abusing the bot (rate limit)."""
     # 🔥 Si l'utilisateur est en mode batch, augmenter la limite
     session = sessions.get(user_id, {})
     if session.get('batch_mode'):
@@ -902,14 +902,14 @@ def check_rate_limit(user_id):
     return True
 
 def is_duplicate_message(user_id, message_id, command_type="message"):
-    """Vérifie si un message a déjà été traité ou si c'est une commande répétée"""
+    """Checks if a message was already processed or is a repeated command."""
     current_time = datetime.now()
     
-    # Vérifier le rate limit
+    # Check rate limit
     if not check_rate_limit(user_id):
         return "rate_limit"
     
-    # Protection contre les commandes répétées (même utilisateur, même commande, < 2 secondes)
+    # Protection against repeated commands (same user, same command, < 2 seconds)
     if command_type in ["start", "batch", "process"]:
         if user_id in user_last_command:
             last_cmd, last_time = user_last_command[user_id]
@@ -929,7 +929,7 @@ def is_duplicate_message(user_id, message_id, command_type="message"):
     for k in keys_to_remove:
         del processed_messages[k]
     
-    # Vérifier si le message est un doublon
+    # Check if the message is a duplicate
     if key in processed_messages:
         return "duplicate"
     
@@ -937,18 +937,18 @@ def is_duplicate_message(user_id, message_id, command_type="message"):
     return False
 
 async def send_limit_message(client, chat_id, limit_type):
-    """Envoie un message d'information selon le type de limite atteinte"""
+    """Send an informational message based on the limit reached."""
     if limit_type == "rate_limit":
         await client.send_message(
             chat_id,
-            "⛔️ **Limite atteinte** : Tu ne peux envoyer que 30 fichiers par minute.\n\n"
-            "⏰ Réessaie dans quelques secondes."
+            "⛔️ Limit reached: You can only send 30 files per minute.\n\n"
+            "⏰ Try again in a few seconds."
         )
     elif limit_type == "duplicate":
         await client.send_message(
             chat_id,
-            "⚠️ **Fichier déjà traité** : Ce fichier a déjà été traité récemment.\n\n"
-            "⏰ Attends 5 minutes avant de le renvoyer."
+            "⚠️ Duplicate file: This file was processed recently.\n\n"
+            "⏰ Please wait 5 minutes before sending it again."
         )
 
 def reset_session_flags(user_id):
@@ -1021,18 +1021,18 @@ async def cmd_cancel(client: Client, message: Message) -> None:
     active_count = get_active_tasks_count(user_id)
     if active_count == 0:
         await message.reply_text(
-            "ℹ️ **Aucune opération en cours**\n\nIl n'y a rien à annuler pour le moment.",
+            "ℹ️ **No operation in progress**\n\nThere is nothing to cancel right now.",
             parse_mode=enums.ParseMode.MARKDOWN,
         )
         return
     status_msg = await message.reply_text(
-        f"⏳ **Annulation en cours...**\n\nArrêt de {active_count} opération(s)...",
+        f"⏳ **Cancelling...**\n\nStopping {active_count} operation(s)...",
         parse_mode=enums.ParseMode.MARKDOWN,
     )
     cancelled = await cancel_user_tasks(user_id)
     if cancelled > 0:
         await status_msg.edit_text(
-            f"✅ **Opération(s) annulée(s) avec succès!**\n\n• {cancelled} tâche(s) stoppée(s)\n• Vous pouvez maintenant lancer une nouvelle opération",
+            f"✅ **Operation(s) cancelled successfully!**\n\n• {cancelled} task(s) stopped\n• You can start a new operation now",
             parse_mode=enums.ParseMode.MARKDOWN,
         )
         try:
@@ -1044,7 +1044,7 @@ async def cmd_cancel(client: Client, message: Message) -> None:
             sessions[user_id].pop('batch_files', None)
     else:
         await status_msg.edit_text(
-            "ℹ️ **Aucune opération active trouvée**\n\nToutes les opérations étaient déjà terminées.",
+            "ℹ️ **No active operations found**\n\nAll operations had already finished.",
             parse_mode=enums.ParseMode.MARKDOWN,
         )
 
@@ -1058,13 +1058,13 @@ async def cmd_deletebanner(client: Client, message: Message) -> None:
         files = _list_user_banners(user_id)
         if not files:
             await message.reply_text(
-                "😶 **Aucune bannière à supprimer**\n\nVous n'avez pas de bannières enregistrées.",
+                "😶 **No banners to delete**\n\nYou don't have any saved banners.",
                 parse_mode=enums.ParseMode.MARKDOWN,
             )
             return
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Oui, tout supprimer", callback_data=f"delban_all_{user_id}"), InlineKeyboardButton("❌ Annuler", callback_data="delban_cancel")]])
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes, delete all", callback_data=f"delban_all_{user_id}"), InlineKeyboardButton("❌ Cancel", callback_data="delban_cancel")]])
         await message.reply_text(
-            f"⚠️ **Confirmation requise**\n\nÊtes-vous sûr de vouloir supprimer **{len(files)} bannière(s)** ?\nCette action est irréversible.",
+            f"⚠️ **Confirmation required**\n\nAre you sure you want to delete **{len(files)} banner(s)**?\nThis action cannot be undone.",
             parse_mode=enums.ParseMode.MARKDOWN,
             reply_markup=keyboard,
         )
@@ -1075,13 +1075,13 @@ async def cmd_deletebanner(client: Client, message: Message) -> None:
         files = _list_user_banners(user_id)
         if not files:
             await message.reply_text(
-                "😶 **Aucune bannière enregistrée**\n\nUtilisez /setbanner pour ajouter une bannière.",
+                "😶 **No saved banners**\n\nUse /setbanner to add a banner.",
                 parse_mode=enums.ParseMode.MARKDOWN,
             )
             return
         if idx < 1 or idx > len(files):
             await message.reply_text(
-                f"❌ **Index invalide**\n\nVeuillez choisir un nombre entre 1 et {len(files)}.",
+                f"❌ **Invalid index**\n\nPlease choose a number between 1 and {len(files)}.",
                 parse_mode=enums.ParseMode.MARKDOWN,
             )
             return
@@ -1090,20 +1090,20 @@ async def cmd_deletebanner(client: Client, message: Message) -> None:
         if ok:
             remaining = len(_list_user_banners(user_id))
             await message.reply_text(
-                f"🗑️ **Bannière supprimée avec succès!**\n\n• Fichier: `{target.name}`\n• Bannières restantes: {remaining}",
-                parse_mode="Markdown",
+                f"🗑️ **Banner deleted successfully!**\n\n• File: `{target.name}`\n• Banners remaining: {remaining}",
+                parse_mode=enums.ParseMode.MARKDOWN,
             )
         else:
             await message.reply_text(
-                "❌ **Erreur lors de la suppression**\n\nImpossible de supprimer cette bannière.",
-                parse_mode="Markdown",
+                "❌ **Deletion error**\n\nUnable to delete this banner.",
+                parse_mode=enums.ParseMode.MARKDOWN,
             )
         return
 
     files = _list_user_banners(user_id)
     if not files:
         await message.reply_text(
-            "😶 **Aucune bannière enregistrée**\n\nUtilisez `/setbanner` pour ajouter une bannière.",
+            "😶 **No saved banners**\n\nUse `/setbanner` to add a banner.",
             parse_mode=enums.ParseMode.MARKDOWN,
         )
         return
@@ -1114,10 +1114,10 @@ async def cmd_deletebanner(client: Client, message: Message) -> None:
         for j in range(i, min(i+3, len(files))):
             row.append(InlineKeyboardButton(f"🗑️ #{j+1}", callback_data=f"delban_{j+1}_{user_id}"))
         buttons.append(row)
-    buttons.append([InlineKeyboardButton("🗑️ Tout supprimer", callback_data=f"delban_all_{user_id}")])
+    buttons.append([InlineKeyboardButton("🗑️ Delete all", callback_data=f"delban_all_{user_id}")])
     keyboard = InlineKeyboardMarkup(buttons)
     await message.reply_text(
-        f"📂 **Vos bannières enregistrées** ({len(files)}):\n\n{listing}\n\nCliquez sur un bouton pour supprimer:",
+        f"📂 **Your saved banners** ({len(files)}):\n\n{listing}\n\nTap a button to delete:",
         parse_mode=enums.ParseMode.MARKDOWN,
         reply_markup=keyboard,
     )
@@ -1127,12 +1127,12 @@ async def callback_delete_banner(client: Client, callback_query: CallbackQuery):
     data = callback_query.data
     user_id = callback_query.from_user.id
     if data == "delban_cancel":
-        await callback_query.message.edit_text("❌ **Suppression annulée**", parse_mode=enums.ParseMode.MARKDOWN)
+        await callback_query.message.edit_text("❌ **Deletion cancelled**", parse_mode=enums.ParseMode.MARKDOWN)
         return
     if data.startswith("delban_all_"):
         target_user = int(data.split("_")[2])
         if user_id != target_user:
-            await callback_query.answer("❌ Cette action n'est pas pour vous!", show_alert=True)
+            await callback_query.answer("❌ This action is not for you!", show_alert=True)
             return
         d = _user_banner_dir(user_id)
         ok = True
@@ -1153,12 +1153,12 @@ async def callback_delete_banner(client: Client, callback_query: CallbackQuery):
             pass
         if ok:
             await callback_query.message.edit_text(
-                "🗑️ **Toutes les bannières ont été supprimées!**\n\nVous pouvez ajouter de nouvelles bannières avec `/setbanner`.",
+                "🗑️ **All banners have been deleted!**\n\nYou can add new banners with `/setbanner`.",
                 parse_mode=enums.ParseMode.MARKDOWN,
             )
         else:
             await callback_query.message.edit_text(
-                "❌ **Erreur lors de la suppression**\n\nImpossible de supprimer les bannières.",
+                "❌ **Deletion error**\n\nUnable to delete banners.",
                 parse_mode=enums.ParseMode.MARKDOWN,
             )
         return
@@ -1167,7 +1167,7 @@ async def callback_delete_banner(client: Client, callback_query: CallbackQuery):
         idx = int(idx_str)
         target_user = int(target_user_str)
         if user_id != target_user:
-            await callback_query.answer("❌ Cette action n'est pas pour vous!", show_alert=True)
+            await callback_query.answer("❌ This action is not for you!", show_alert=True)
             return
         files = _list_user_banners(user_id)
         if 1 <= idx <= len(files):
@@ -1176,13 +1176,13 @@ async def callback_delete_banner(client: Client, callback_query: CallbackQuery):
             if ok:
                 remaining = len(_list_user_banners(user_id))
                 await callback_query.message.edit_text(
-                    f"🗑️ **Bannière #{idx} supprimée!**\n\n• Fichier: `{target.name}`\n• Bannières restantes: {remaining}",
+                    f"🗑️ **Banner #{idx} deleted!**\n\n• File: `{target.name}`\n• Banners remaining: {remaining}",
                     parse_mode=enums.ParseMode.MARKDOWN,
                 )
             else:
-                await callback_query.message.edit_text("❌ **Erreur lors de la suppression**", parse_mode=enums.ParseMode.MARKDOWN)
+                await callback_query.message.edit_text("❌ **Deletion error**", parse_mode=enums.ParseMode.MARKDOWN)
         else:
-            await callback_query.message.edit_text("❌ **Index invalide**", parse_mode=enums.ParseMode.MARKDOWN)
+            await callback_query.message.edit_text("❌ **Invalid index**", parse_mode=enums.ParseMode.MARKDOWN)
 
 
 def get_forced_channels() -> List[str]:
@@ -4415,7 +4415,7 @@ async def cmd_setbanner(client, message: Message):
         await send_force_join_message(client, message)
         return
     sessions.setdefault(uid, {})["awaiting_banner_upload"] = True
-    await client.send_message(message.chat.id, "🖼️ Envoie-moi ta bannière (image ou PDF d'une page).")
+    await client.send_message(message.chat.id, "🖼️ Send me your banner (image or 1-page PDF).")
 
 @app.on_message(filters.command(["view_banner", "viewbanner"]) & filters.private)
 @admin_only
@@ -4427,12 +4427,12 @@ async def cmd_view_banner(client, message: Message):
         return
     bp = get_user_pdf_settings(uid).get("banner_path")
     if not bp or not os.path.exists(bp):
-        await client.send_message(message.chat.id, "ℹ️ Aucune bannière définie. Utilise /setbanner")
+        await client.send_message(message.chat.id, "ℹ️ No banner set. Use /setbanner")
         return
     if bp.lower().endswith(".pdf"):
-        await client.send_document(message.chat.id, bp, caption="📄 Bannière (PDF)")
+        await client.send_document(message.chat.id, bp, caption="📄 Banner (PDF)")
     else:
-        await client.send_photo(message.chat.id, bp, caption="🖼️ Bannière (image)")
+        await client.send_photo(message.chat.id, bp, caption="🖼️ Banner (image)")
 
 @app.on_message(filters.command(["setpassword"]) & filters.private)
 @admin_only
