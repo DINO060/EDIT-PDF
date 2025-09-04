@@ -25,9 +25,8 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, 
 from pyrogram.errors import UserNotParticipant, ChatAdminRequired, UsernameNotOccupied
 from pyrogram.enums import ChatMemberStatus
 
-# Task management and extra handlers
-from utils.tasks import register_task, cancel_user_tasks
-from handlers.cancel_and_banners import cmd_cancel, cmd_deletebanner, callback_delete_banner
+# Task management
+from utils.tasks import register_task, cancel_user_tasks, get_active_tasks_count
 
 # Import configuration
 def get_env_or_config(attr, default=None):
@@ -980,6 +979,211 @@ app = Client(
 """ FORCE JOIN (multi-channels, persistant) """
 DEFAULT_FORCE_JOIN = []  # ex: ["djd208"]
 FORCE_JOIN_REQUIRE_ALL = False
+
+# ===== Inline handlers: /cancel and /deletebanner =====
+
+def _user_banner_dir(user_id: int) -> Path:
+    return Path("data/banners") / str(user_id)
+
+def _list_user_banners(user_id: int) -> list[Path]:
+    found: list[Path] = []
+    d = _user_banner_dir(user_id)
+    if d.exists():
+        found.extend([p for p in d.iterdir() if p.is_file()])
+    try:
+        bp = get_user_pdf_settings(user_id).get("banner_path")
+        if bp and os.path.exists(bp):
+            found.append(Path(bp))
+    except Exception:
+        pass
+    uniq = []
+    seen = set()
+    for p in found:
+        ap = str(p.resolve()) if p.exists() else str(p)
+        if ap not in seen:
+            uniq.append(p)
+            seen.add(ap)
+    return sorted(uniq, key=lambda x: x.name.lower())
+
+def _delete_banner_file_and_setting(user_id: int, target: Path) -> bool:
+    try:
+        bp = get_user_pdf_settings(user_id).get("banner_path")
+        if bp and os.path.abspath(bp) == os.path.abspath(str(target)):
+            update_user_pdf_settings(user_id, banner_path=None)
+        target.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+@app.on_message(filters.command(["cancel"]) & filters.private)
+async def cmd_cancel(client: Client, message: Message) -> None:
+    user_id = message.from_user.id
+    active_count = get_active_tasks_count(user_id)
+    if active_count == 0:
+        await message.reply_text(
+            "ℹ️ **Aucune opération en cours**\n\nIl n'y a rien à annuler pour le moment.",
+            parse_mode="Markdown",
+        )
+        return
+    status_msg = await message.reply_text(
+        f"⏳ **Annulation en cours...**\n\nArrêt de {active_count} opération(s)...",
+        parse_mode="Markdown",
+    )
+    cancelled = await cancel_user_tasks(user_id)
+    if cancelled > 0:
+        await status_msg.edit_text(
+            f"✅ **Opération(s) annulée(s) avec succès!**\n\n• {cancelled} tâche(s) stoppée(s)\n• Vous pouvez maintenant lancer une nouvelle opération",
+            parse_mode="Markdown",
+        )
+        try:
+            clear_processing_flag(user_id, source="cancel", reason="user_cancel")
+        except Exception:
+            pass
+        if user_id in sessions:
+            sessions[user_id].pop('batch_mode', None)
+            sessions[user_id].pop('batch_files', None)
+    else:
+        await status_msg.edit_text(
+            "ℹ️ **Aucune opération active trouvée**\n\nToutes les opérations étaient déjà terminées.",
+            parse_mode="Markdown",
+        )
+
+@app.on_message(filters.command(["deletebanner", "deletbanner"]) & filters.private)
+async def cmd_deletebanner(client: Client, message: Message) -> None:
+    user_id = message.from_user.id
+    args = message.text.split(maxsplit=1)
+    arg = args[1].strip().lower() if len(args) > 1 else None
+
+    if arg in {"all", "tout", "tous", "toutes"}:
+        files = _list_user_banners(user_id)
+        if not files:
+            await message.reply_text(
+                "😶 **Aucune bannière à supprimer**\n\nVous n'avez pas de bannières enregistrées.",
+                parse_mode="Markdown",
+            )
+            return
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Oui, tout supprimer", callback_data=f"delban_all_{user_id}"), InlineKeyboardButton("❌ Annuler", callback_data="delban_cancel")]])
+        await message.reply_text(
+            f"⚠️ **Confirmation requise**\n\nÊtes-vous sûr de vouloir supprimer **{len(files)} bannière(s)** ?\nCette action est irréversible.",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+        return
+
+    if arg and arg.isdigit():
+        idx = int(arg)
+        files = _list_user_banners(user_id)
+        if not files:
+            await message.reply_text(
+                "😶 **Aucune bannière enregistrée**\n\nUtilisez /setbanner pour ajouter une bannière.",
+                parse_mode="Markdown",
+            )
+            return
+        if idx < 1 or idx > len(files):
+            await message.reply_text(
+                f"❌ **Index invalide**\n\nVeuillez choisir un nombre entre 1 et {len(files)}.",
+                parse_mode="Markdown",
+            )
+            return
+        target = files[idx - 1]
+        ok = _delete_banner_file_and_setting(user_id, target)
+        if ok:
+            remaining = len(_list_user_banners(user_id))
+            await message.reply_text(
+                f"🗑️ **Bannière supprimée avec succès!**\n\n• Fichier: `{target.name}`\n• Bannières restantes: {remaining}",
+                parse_mode="Markdown",
+            )
+        else:
+            await message.reply_text(
+                "❌ **Erreur lors de la suppression**\n\nImpossible de supprimer cette bannière.",
+                parse_mode="Markdown",
+            )
+        return
+
+    files = _list_user_banners(user_id)
+    if not files:
+        await message.reply_text(
+            "😶 **Aucune bannière enregistrée**\n\nUtilisez `/setbanner` pour ajouter une bannière.",
+            parse_mode="Markdown",
+        )
+        return
+    listing = "\n".join(f"`{i+1}.` {p.name[:30]}{'...' if len(p.name) > 30 else ''}" for i, p in enumerate(files))
+    buttons = []
+    for i in range(0, len(files), 3):
+        row = []
+        for j in range(i, min(i+3, len(files))):
+            row.append(InlineKeyboardButton(f"🗑️ #{j+1}", callback_data=f"delban_{j+1}_{user_id}"))
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("🗑️ Tout supprimer", callback_data=f"delban_all_{user_id}")])
+    keyboard = InlineKeyboardMarkup(buttons)
+    await message.reply_text(
+        f"📂 **Vos bannières enregistrées** ({len(files)}):\n\n{listing}\n\nCliquez sur un bouton pour supprimer:",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+@app.on_callback_query(filters.regex(r"^delban_"))
+async def callback_delete_banner(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    user_id = callback_query.from_user.id
+    if data == "delban_cancel":
+        await callback_query.message.edit_text("❌ **Suppression annulée**", parse_mode="Markdown")
+        return
+    if data.startswith("delban_all_"):
+        target_user = int(data.split("_")[2])
+        if user_id != target_user:
+            await callback_query.answer("❌ Cette action n'est pas pour vous!", show_alert=True)
+            return
+        d = _user_banner_dir(user_id)
+        ok = True
+        if d.exists():
+            try:
+                shutil.rmtree(d)
+            except Exception:
+                ok = False
+        try:
+            bp = get_user_pdf_settings(user_id).get("banner_path")
+            if bp and os.path.exists(bp):
+                try:
+                    os.remove(bp)
+                except Exception:
+                    ok = False
+            update_user_pdf_settings(user_id, banner_path=None)
+        except Exception:
+            pass
+        if ok:
+            await callback_query.message.edit_text(
+                "🗑️ **Toutes les bannières ont été supprimées!**\n\nVous pouvez ajouter de nouvelles bannières avec `/setbanner`.",
+                parse_mode="Markdown",
+            )
+        else:
+            await callback_query.message.edit_text(
+                "❌ **Erreur lors de la suppression**\n\nImpossible de supprimer les bannières.",
+                parse_mode="Markdown",
+            )
+        return
+    if data.count("_") == 2:
+        _, idx_str, target_user_str = data.split("_")
+        idx = int(idx_str)
+        target_user = int(target_user_str)
+        if user_id != target_user:
+            await callback_query.answer("❌ Cette action n'est pas pour vous!", show_alert=True)
+            return
+        files = _list_user_banners(user_id)
+        if 1 <= idx <= len(files):
+            target = files[idx - 1]
+            ok = _delete_banner_file_and_setting(user_id, target)
+            if ok:
+                remaining = len(_list_user_banners(user_id))
+                await callback_query.message.edit_text(
+                    f"🗑️ **Bannière #{idx} supprimée!**\n\n• Fichier: `{target.name}`\n• Bannières restantes: {remaining}",
+                    parse_mode="Markdown",
+                )
+            else:
+                await callback_query.message.edit_text("❌ **Erreur lors de la suppression**", parse_mode="Markdown")
+        else:
+            await callback_query.message.edit_text("❌ **Index invalide**", parse_mode="Markdown")
+
 
 def get_forced_channels() -> List[str]:
     data = _load_json(FJ_FILE, {"channels": DEFAULT_FORCE_JOIN})
