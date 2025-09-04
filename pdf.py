@@ -25,6 +25,10 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, 
 from pyrogram.errors import UserNotParticipant, ChatAdminRequired, UsernameNotOccupied
 from pyrogram.enums import ChatMemberStatus
 
+# Task management and extra handlers
+from utils.tasks import register_task, cancel_user_tasks
+from handlers.cancel_and_banners import cmd_cancel, cmd_deletebanner, callback_delete_banner
+
 # Import configuration
 def get_env_or_config(attr, default=None):
     value = os.environ.get(attr)
@@ -491,7 +495,10 @@ def set_processing_flag(user_id: int, chat_id: int | None = None, source: str = 
     logger.info(f"[processing] SET user=%s source=%s", user_id, sess.get('processing_source', source))
     # Start watchdog
     try:
-        sess['processing_watchdog'] = asyncio.create_task(_processing_watchdog(user_id))
+        task = asyncio.create_task(_processing_watchdog(user_id))
+        # Register user-specific task for /cancel support
+        register_task(user_id, task)
+        sess['processing_watchdog'] = task
     except Exception as e:
         logger.warning(f"[processing] Failed to start watchdog for user {user_id}: {e}")
 
@@ -4262,154 +4269,6 @@ async def cmd_reset_password(client, message: Message):
     sessions.setdefault(uid, {})["awaiting_new_password"] = True
     await client.send_message(message.chat.id, "🔐 Send the new default password now.")
 
-# ===== Multi-banner management commands =====
-@app.on_message(filters.command(["setbanied", "setbaneid"]) & filters.private)
-async def cmd_setbanied(client, message: Message):
-    uid = message.from_user.id
-    # Force-join check
-    if not await is_user_in_channel(uid):
-        await send_force_join_message(client, message)
-        return
-    ensure_banied_dir(uid)
-    BANIED_ADD_MODE.add(uid)
-    await client.send_message(message.chat.id, "📨 Envoie moi le banners")
-
-@app.on_message(filters.command(["donebanied"]) & filters.private)
-async def cmd_donebanied(client, message: Message):
-    uid = message.from_user.id
-    # Force-join check
-    if not await is_user_in_channel(uid):
-        await send_force_join_message(client, message)
-        return
-    BANIED_ADD_MODE.discard(uid)
-    cnt = len(list_banied_images(uid))
-    await client.send_message(message.chat.id, f"✅ Mode d'ajout de bannières désactivé. Tu as {cnt} bannière(s).")
-
-@app.on_message(filters.command(["viewbanied"]) & filters.private)
-async def cmd_viewbanied(client, message: Message):
-    uid = message.from_user.id
-    # Force-join check
-    if not await is_user_in_channel(uid):
-        await send_force_join_message(client, message)
-        return
-    imgs = list_banied_images(uid)
-    if not imgs:
-        await client.send_message(message.chat.id, "ℹ️ Aucune bannière enregistrée. Utilise /setbanied pour en ajouter.")
-        return
-    # Send a short summary and first few images
-    await client.send_message(message.chat.id, f"🧾 Tu as {len(imgs)} bannière(s). Affichage des 5 premières…")
-    for i, p in enumerate(imgs[:5], start=1):
-        try:
-            await client.send_photo(message.chat.id, str(p), caption=f"#{i}: {p.name}")
-        except Exception:
-            try:
-                await client.send_document(message.chat.id, str(p), caption=f"#{i}: {p.name}")
-            except Exception:
-                pass
-
-@app.on_message(filters.command(["deletebanied"]) & filters.private)
-async def cmd_deletebanied(client, message: Message):
-    uid = message.from_user.id
-    # Force-join check
-    if not await is_user_in_channel(uid):
-        await send_force_join_message(client, message)
-        return
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        # No argument: smart behavior
-        imgs = list_banied_images(uid)
-        if not imgs:
-            await client.send_message(message.chat.id, "ℹ️ Aucune bannière enregistrée. Utilise /setbanied pour en ajouter.")
-            return
-        if len(imgs) == 1:
-            # Auto-delete the only one
-            n = delete_banied(uid, 1)
-            if n:
-                await client.send_message(message.chat.id, "🗑️ Bannière #1 supprimée.")
-            else:
-                await client.send_message(message.chat.id, "❌ Échec de suppression de la bannière #1.")
-            return
-        # Multiple images: show selection keyboard
-        buttons = []
-        max_buttons = min(len(imgs), 25)
-        for i in range(1, max_buttons + 1):
-            buttons.append(InlineKeyboardButton(str(i), callback_data=f"banied_del:{i}"))
-        # Group by 5 per row
-        rows = [buttons[i:i+5] for i in range(0, len(buttons), 5)]
-        rows.append([
-            InlineKeyboardButton("All", callback_data="banied_del:all"),
-            InlineKeyboardButton("Cancel", callback_data="banied_del:cancel"),
-        ])
-        await client.send_message(
-            message.chat.id,
-            "🧹 Sélectionne la bannière à supprimer:",
-            reply_markup=InlineKeyboardMarkup(rows)
-        )
-        return
-    arg = args[1].strip().lower()
-    if arg in {"all", "*"}:
-        n = delete_banied(uid, None)
-        await client.send_message(message.chat.id, f"🗑️ {n} bannière(s) supprimée(s).")
-        return
-    try:
-        idx = int(arg)
-    except Exception:
-        await client.send_message(message.chat.id, "❌ Index invalide. Utilise un nombre ou 'all'.")
-        return
-    n = delete_banied(uid, idx)
-    if n:
-        await client.send_message(message.chat.id, f"🗑️ Bannière #{idx} supprimée.")
-    else:
-        await client.send_message(message.chat.id, f"❌ Bannière #{idx} introuvable.")
-
-@app.on_callback_query(filters.regex(r"^banied_del:(.+)$"))
-async def cb_banied_del(client, query: CallbackQuery):
-    uid = query.from_user.id
-    # Force-join check for callbacks
-    if not await is_user_in_channel(uid):
-        try:
-            await query.answer("Please join the channel to use this.", show_alert=True)
-        except Exception:
-            pass
-        try:
-            await send_force_join_message(client, query.message)
-        except Exception:
-            pass
-        return
-    try:
-        data = query.data.split(":", 1)[1]
-    except Exception:
-        await query.answer("Invalid action", show_alert=True)
-        return
-    if data == "cancel":
-        try:
-            await query.edit_message_text("❎ Suppression annulée.")
-        except Exception:
-            pass
-        return
-    if data in {"all", "*"}:
-        n = delete_banied(uid, None)
-        try:
-            await query.edit_message_text(f"🗑️ {n} bannière(s) supprimée(s).")
-        except Exception:
-            pass
-        return
-    try:
-        idx = int(data)
-    except Exception:
-        await query.answer("Index invalide.", show_alert=True)
-        return
-    n = delete_banied(uid, idx)
-    if n:
-        try:
-            await query.edit_message_text(f"🗑️ Bannière #{idx} supprimée.")
-        except Exception:
-            pass
-    else:
-        try:
-            await query.edit_message_text(f"❌ Bannière #{idx} introuvable.")
-        except Exception:
-            pass
 
 @app.on_message(filters.command(["setextra_pages"]) & filters.private)
 @admin_only
