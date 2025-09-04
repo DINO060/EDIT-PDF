@@ -19,7 +19,7 @@ import mimetypes
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters, idle, enums
 from pyrogram.enums import ParseMode
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import UserNotParticipant, ChatAdminRequired, UsernameNotOccupied
@@ -1022,18 +1022,18 @@ async def cmd_cancel(client: Client, message: Message) -> None:
     if active_count == 0:
         await message.reply_text(
             "ℹ️ **Aucune opération en cours**\n\nIl n'y a rien à annuler pour le moment.",
-            parse_mode="Markdown",
+            parse_mode=enums.ParseMode.MARKDOWN,
         )
         return
     status_msg = await message.reply_text(
         f"⏳ **Annulation en cours...**\n\nArrêt de {active_count} opération(s)...",
-        parse_mode="Markdown",
+        parse_mode=enums.ParseMode.MARKDOWN,
     )
     cancelled = await cancel_user_tasks(user_id)
     if cancelled > 0:
         await status_msg.edit_text(
             f"✅ **Opération(s) annulée(s) avec succès!**\n\n• {cancelled} tâche(s) stoppée(s)\n• Vous pouvez maintenant lancer une nouvelle opération",
-            parse_mode="Markdown",
+            parse_mode=enums.ParseMode.MARKDOWN,
         )
         try:
             clear_processing_flag(user_id, source="cancel", reason="user_cancel")
@@ -1045,7 +1045,7 @@ async def cmd_cancel(client: Client, message: Message) -> None:
     else:
         await status_msg.edit_text(
             "ℹ️ **Aucune opération active trouvée**\n\nToutes les opérations étaient déjà terminées.",
-            parse_mode="Markdown",
+            parse_mode=enums.ParseMode.MARKDOWN,
         )
 
 @app.on_message(filters.command(["deletebanner", "deletbanner"]) & filters.private)
@@ -1059,13 +1059,13 @@ async def cmd_deletebanner(client: Client, message: Message) -> None:
         if not files:
             await message.reply_text(
                 "😶 **Aucune bannière à supprimer**\n\nVous n'avez pas de bannières enregistrées.",
-                parse_mode="Markdown",
+                parse_mode=enums.ParseMode.MARKDOWN,
             )
             return
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Oui, tout supprimer", callback_data=f"delban_all_{user_id}"), InlineKeyboardButton("❌ Annuler", callback_data="delban_cancel")]])
         await message.reply_text(
             f"⚠️ **Confirmation requise**\n\nÊtes-vous sûr de vouloir supprimer **{len(files)} bannière(s)** ?\nCette action est irréversible.",
-            parse_mode="Markdown",
+            parse_mode=enums.ParseMode.MARKDOWN,
             reply_markup=keyboard,
         )
         return
@@ -1076,13 +1076,13 @@ async def cmd_deletebanner(client: Client, message: Message) -> None:
         if not files:
             await message.reply_text(
                 "😶 **Aucune bannière enregistrée**\n\nUtilisez /setbanner pour ajouter une bannière.",
-                parse_mode="Markdown",
+                parse_mode=enums.ParseMode.MARKDOWN,
             )
             return
         if idx < 1 or idx > len(files):
             await message.reply_text(
                 f"❌ **Index invalide**\n\nVeuillez choisir un nombre entre 1 et {len(files)}.",
-                parse_mode="Markdown",
+                parse_mode=enums.ParseMode.MARKDOWN,
             )
             return
         target = files[idx - 1]
@@ -1104,7 +1104,7 @@ async def cmd_deletebanner(client: Client, message: Message) -> None:
     if not files:
         await message.reply_text(
             "😶 **Aucune bannière enregistrée**\n\nUtilisez `/setbanner` pour ajouter une bannière.",
-            parse_mode="Markdown",
+            parse_mode=enums.ParseMode.MARKDOWN,
         )
         return
     listing = "\n".join(f"`{i+1}.` {p.name[:30]}{'...' if len(p.name) > 30 else ''}" for i, p in enumerate(files))
@@ -1118,7 +1118,7 @@ async def cmd_deletebanner(client: Client, message: Message) -> None:
     keyboard = InlineKeyboardMarkup(buttons)
     await message.reply_text(
         f"📂 **Vos bannières enregistrées** ({len(files)}):\n\n{listing}\n\nCliquez sur un bouton pour supprimer:",
-        parse_mode="Markdown",
+        parse_mode=enums.ParseMode.MARKDOWN,
         reply_markup=keyboard,
     )
 
@@ -1127,7 +1127,7 @@ async def callback_delete_banner(client: Client, callback_query: CallbackQuery):
     data = callback_query.data
     user_id = callback_query.from_user.id
     if data == "delban_cancel":
-        await callback_query.message.edit_text("❌ **Suppression annulée**", parse_mode="Markdown")
+        await callback_query.message.edit_text("❌ **Suppression annulée**", parse_mode=enums.ParseMode.MARKDOWN)
         return
     if data.startswith("delban_all_"):
         target_user = int(data.split("_")[2])
@@ -1154,12 +1154,12 @@ async def callback_delete_banner(client: Client, callback_query: CallbackQuery):
         if ok:
             await callback_query.message.edit_text(
                 "🗑️ **Toutes les bannières ont été supprimées!**\n\nVous pouvez ajouter de nouvelles bannières avec `/setbanner`.",
-                parse_mode="Markdown",
+                parse_mode=enums.ParseMode.MARKDOWN,
             )
         else:
             await callback_query.message.edit_text(
                 "❌ **Erreur lors de la suppression**\n\nImpossible de supprimer les bannières.",
-                parse_mode="Markdown",
+                parse_mode=enums.ParseMode.MARKDOWN,
             )
         return
     if data.count("_") == 2:
@@ -1177,12 +1177,12 @@ async def callback_delete_banner(client: Client, callback_query: CallbackQuery):
                 remaining = len(_list_user_banners(user_id))
                 await callback_query.message.edit_text(
                     f"🗑️ **Bannière #{idx} supprimée!**\n\n• Fichier: `{target.name}`\n• Bannières restantes: {remaining}",
-                    parse_mode="Markdown",
+                    parse_mode=enums.ParseMode.MARKDOWN,
                 )
             else:
-                await callback_query.message.edit_text("❌ **Erreur lors de la suppression**", parse_mode="Markdown")
+                await callback_query.message.edit_text("❌ **Erreur lors de la suppression**", parse_mode=enums.ParseMode.MARKDOWN)
         else:
-            await callback_query.message.edit_text("❌ **Index invalide**", parse_mode="Markdown")
+            await callback_query.message.edit_text("❌ **Index invalide**", parse_mode=enums.ParseMode.MARKDOWN)
 
 
 def get_forced_channels() -> List[str]:
