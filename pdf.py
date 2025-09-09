@@ -246,6 +246,7 @@ MESSAGES = {
         "/view_banner - View your banner\n"
         "/setpassword - Set default lock password\n"
         "/reset_password - Change default lock password\n"
+        "/deletepassword - Delete default lock password\n"
         "/setextra_pages - Extract a page as image\n"
         "/deletebanner - Delete or list saved banners\n"
         "/cancel - Cancel all running tasks\n"
@@ -3230,6 +3231,9 @@ async def handle_all_text(client, message: Message):
         if txt.startswith("/reset_password"):
             await cmd_reset_password(client, message)
             return
+        if txt.startswith("/deletepassword"):
+            await cmd_deletepassword(client, message)
+            return
         if txt.startswith("/setextra_pages"):
             await cmd_setextra_pages(client, message)
             return
@@ -4476,6 +4480,22 @@ async def cmd_reset_password(client, message: Message):
     await client.send_message(message.chat.id, "🔐 Send the new default password now.")
 
 
+@app.on_message(filters.command(["deletepassword"]) & filters.private)
+async def cmd_deletepassword(client, message: Message):
+    uid = message.from_user.id
+    # Force-join check
+    if not await is_user_in_channel(uid):
+        await send_force_join_message(client, message)
+        return
+    update_user_pdf_settings(uid, lock_password=None)
+    # Ensure we are not awaiting a new password anymore
+    try:
+        sessions.setdefault(uid, {})["awaiting_new_password"] = False
+    except Exception:
+        pass
+    await client.send_message(message.chat.id, "🔓 Default password removed.", disable_notification=False)
+
+
 @app.on_message(filters.command(["setextra_pages"]) & filters.private)
 @admin_only
 async def cmd_setextra_pages(client, message: Message):
@@ -4496,6 +4516,9 @@ async def cmd_setextra_pages(client, message: Message):
 async def on_text_extensions(client, message: Message):
     uid = message.from_user.id
     chat_id = message.chat.id
+    # Ignore slash commands in this text-based state handler
+    if message.text and message.text.startswith('/'):
+        return
     # Force-join check
     if not await is_user_in_channel(uid):
         await send_force_join_message(client, message)

@@ -1,0 +1,37 @@
+2025-09-09 11:09:24,373 - pyrogram.session.auth - INFO - Start creating a new auth key on DC2
+2025-09-09 11:09:24,374 - pyrogram.connection.connection - INFO - Connecting...
+2025-09-09 11:09:24,496 - pyrogram.connection.connection - INFO - Connected! Production DC2 - IPv4
+2025-09-09 11:09:26,300 - pyrogram.session.auth - INFO - Done auth key exchange: DhGenOk
+2025-09-09 11:09:26,302 - pyrogram.connection.connection - INFO - Disconnected
+2025-09-09 11:09:26,329 - pyrogram.connection.connection - INFO - Connecting...
+2025-09-09 11:09:26,457 - pyrogram.connection.connection - INFO - Connected! Production DC2 - IPv4
+2025-09-09 11:09:26,458 - pyrogram.session.session - INFO - NetworkTask started
+2025-09-09 11:09:27,024 - pyrogram.session.session - INFO - Session initialized: Layer 158
+2025-09-09 11:09:27,025 - pyrogram.session.session - INFO - Device: CPython 3.13.5 - Pyrogram 2.0.106
+2025-09-09 11:09:27,026 - pyrogram.session.session - INFO - System: Windows 10 (en)
+2025-09-09 11:09:27,027 - pyrogram.session.session - INFO - Session started
+2025-09-09 11:09:27,036 - pyrogram.session.session - INFO - PingTask started
+2025-09-09 11:09:27,170 - pyrogram.session.session - INFO - PingTask stopped
+2025-09-09 11:09:27,171 - pyrogram.session.session - INFO - NetworkTask stopped
+2025-09-09 11:09:27,171 - pyrogram.connection.connection - INFO - Disconnected
+2025-09-09 11:09:27,171 - pyrogram.session.session - INFO - Session stopped
+2025-09-09 11:09:27,211 - pyrogram.session.auth - INFO - Start creating a new auth key on DC1
+2025-09-09 11:09:27,212 - pyrogram.connection.connection - INFO - Connecting...
+2025-09-09 11:09:27,247 - pyrogram.connection.connection - INFO - Connected! Production DC1 - IPv4
+2025-09-09 11:09:28,522 - pyrogram.session.auth - INFO - Done auth key exchange: DhGenOk
+2025-09-09 11:09:28,523 - pyrogram.connection.connection - INFO - Disconnected
+2025-09-09 11:09:28,544 - pyrogram.connection.connection - INFO - Connecting...
+2025-09-09 11:09:28,562 - pyrogram.connection.connection - INFO - Connected! Production DC1 - IPv4
+2025-09-09 11:09:28,564 - pyrogram.session.session - INFO - NetworkTask started
+2025-09-09 11:09:28,721 - pyrogram.session.session - INFO - Session initialized: Layer 158
+2025-09-09 11:09:28,722 - pyrogram.session.session - INFO - Device: CPython 3.13.5 - Pyrogram 2.0.106
+2025-09-09 11:09:28,723 - pyrogram.session.session - INFO - System: Windows 10 (en)
+2025-09-09 11:09:28,724 - pyrogram.session.session - INFO - Session started
+2025-09-09 11:09:28,726 - pyrogram.session.session - INFO - PingTask started
+2025-09-09 11:09:28,844 - pyrogram.dispatcher - INFO - Started 8 HandlerTasks
+2025-09-09 11:13:29,453 - root - INFO - Stop signal received (SIGINT). Exiting...
+2025-09-09 11:13:29,545 - pyrogram.dispatcher - INFO - Stopped 8 HandlerTasks
+2025-09-09 11:13:29,545 - pyrogram.session.session - INFO - PingTask stopped
+2025-09-09 11:13:29,546 - pyrogram.session.session - INFO - NetworkTask stopped
+2025-09-09 11:13:29,546 - pyrogram.connection.connection - INFO - Disconnected
+2025-09-09 11:13:29,547 - pyrogram.session.session - INFO - Session stopped
