@@ -856,6 +856,22 @@ def get_batch_both_pages_buttons(user_id: int):
     ])
     return keyboard
 
+def get_batch_pages_buttons(user_id: int):
+    """Inline keyboard for Batch 'Remove Pages (all)' selection (First/Last/Middle/Manual)."""
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("The First", callback_data=f"batch_pages_first:{user_id}"),
+            InlineKeyboardButton("The Last", callback_data=f"batch_pages_last:{user_id}"),
+        ],
+        [
+            InlineKeyboardButton("The Middle", callback_data=f"batch_pages_middle:{user_id}"),
+        ],
+        [
+            InlineKeyboardButton("📝 Enter manually", callback_data=f"batch_pages_manual:{user_id}"),
+        ],
+    ])
+    return keyboard
+
 def unlock_pdf(in_pdf: str, out_pdf: str, password: str) -> None:
     with pikepdf.open(in_pdf, password=password) as pdf:
         pdf.save(out_pdf)
@@ -1296,17 +1312,31 @@ def extract_and_clean_pdf_text(page):
         logger.warning(f"Error extracting text: {e}")
     return ""
 
-async def safe_edit_message(message, text):
-    """Édite un message en évitant l'erreur MessageNotModified"""
+async def safe_edit_message(target, text, reply_markup=None):
+    """
+    Édite un message en évitant MESSAGE_NOT_MODIFIED.
+    Accepte soit un CallbackQuery (edit_message_text) soit un Message (edit_text).
+    """
     try:
-        await message.edit_message_text(text)
+        edit_cb = getattr(target, "edit_message_text", None)
+        if callable(edit_cb):
+            if reply_markup is not None:
+                await edit_cb(text, reply_markup=reply_markup)
+            else:
+                await edit_cb(text)
+            return
+
+        # Fallback pour objets Message
+        if reply_markup is not None:
+            await target.edit_text(text, reply_markup=reply_markup)
+        else:
+            await target.edit_text(text)
     except Exception as e:
         if "MESSAGE_NOT_MODIFIED" in str(e):
-            # Ignorer cette erreur, c'est normal
-            logger.debug(f"Message non modifié (même contenu): {e}")
+            logger.debug(f"Message non modifié: {e}")
         else:
             logger.error(f"Error editing message: {e}")
-            raise e
+            raise
 
 async def create_or_edit_status(client, origin, text: str):
     """Create a new status message in the current chat and return it.
@@ -2407,15 +2437,16 @@ async def button_callback(client, query: CallbackQuery):
         
         elif action == "batch_pages":
             sessions[user_id]['batch_action'] = 'pages'
-            await query.edit_message_text(
-                "📝 Which pages to remove from all files?\n\n"
-                "Examples:\n"
+            await safe_edit_message(query,
+                "📝 **Remove Pages (Batch)**\n\n"
+                "Choose a quick option or enter pages manually.\n\n"
+                "Examples for manual entry:\n"
                 "• 1 → removes page 1\n"
                 "• 1,3,5 → removes pages 1, 3 and 5\n"
-                "• 1-5 → removes pages 1 to 5"
+                "• 1-5 → removes pages 1 to 5",
+                reply_markup=get_batch_pages_buttons(user_id)
             )
-            # Do not keep processing active while waiting for user input
-            clear_processing_flag(user_id, source="batch_pages", reason="awaiting_input")
+            clear_processing_flag(user_id, source="batch_pages_menu", reason="menu_shown")
             return
         
         elif action == "batch_both":
@@ -2450,113 +2481,79 @@ async def button_callback(client, query: CallbackQuery):
                     pass
             await process_batch_lock(client, query.message, user_id, pw)
             return
-        # FIXED: Added batch_both_first, batch_both_last, batch_both_middle, batch_both_manual handlers
+        # === QUICK SELECTORS for "Remove pages (all)" in BATCH ===
+        elif action == "batch_pages_first":
+            await safe_edit_message(query, "⏳ Removing the FIRST page from all PDFs…")
+            await process_batch_pages(client, query.message, user_id, "first")
+            clear_processing_flag(user_id, source="batch_pages_first", reason="queued")
+            return
+
+        elif action == "batch_pages_last":
+            await safe_edit_message(query, "⏳ Removing the LAST page from all PDFs…")
+            await process_batch_pages(client, query.message, user_id, "last")
+            clear_processing_flag(user_id, source="batch_pages_last", reason="queued")
+            return
+
+        elif action == "batch_pages_middle":
+            await safe_edit_message(query, "⏳ Removing the MIDDLE page from all PDFs…")
+            await process_batch_pages(client, query.message, user_id, "middle")
+            clear_processing_flag(user_id, source="batch_pages_middle", reason="queued")
+            return
+
+        elif action == "batch_pages_manual":
+            sessions[user_id]['awaiting_batch_pages'] = True
+            await safe_edit_message(
+                query,
+                "📝 **Manual page entry – Batch**\n"
+                "Send pages to remove (e.g. `1`, `1,3,5`, `1-5`) or `none`."
+            )
+            clear_processing_flag(user_id, source="batch_pages_manual", reason="awaiting_input")
+            return
+
+        # === The Both batch quick selectors ===
         elif action == "batch_both_first":
-            logger.info(f"🔍 DEBUG: batch_both_first called for user {user_id}")
-            
-            # Vérifier l'état de la session
-            if user_id not in sessions:
-                logger.error(f"❌ DEBUG: No session found for user {user_id}")
-            else:
-                logger.info(f"🔍 DEBUG: Session exists for user {user_id}")
-                logger.info(f"🔍 DEBUG: Session keys: {list(sessions[user_id].keys())}")
-            
-            # Utiliser ensure_session_dict pour garantir l'existence
-            session = ensure_session_dict(user_id)
-            password = session.get('batch_both_password', '')
-            
-            logger.info(f"🔑 DEBUG: Password retrieved: {bool(password)}")
-            logger.info(f"🔑 DEBUG: Password length: {len(password) if password else 0}")
-            
-            if password:
-                await process_batch_both(client, query.message, user_id, password, "1")
+            pw = ensure_session_dict(user_id).get('batch_both_password', '')
+            if not pw:
+                await safe_edit_message(query, "❌ Missing password. Re-run `/process` → The Both.")
                 return
-            else:
-                logger.error(f"❌ batch_both_first - No password found for user {user_id}")
-                logger.error(f"❌ DEBUG: Session content: {session}")
-                await query.answer("❌ Password not found. Please restart with /process", show_alert=True)
-                await safe_edit_message(query, "❌ Error: missing password.\n\nPlease use `/process` to start again.")
-                return
-        
+            await safe_edit_message(query, "⏳ The Both (remove FIRST page) running on all PDFs…")
+            await process_batch_both(client, query.message, user_id, pw, "first")
+            clear_processing_flag(user_id, source="batch_both_first", reason="queued")
+            return
+
         elif action == "batch_both_last":
-            # FIX: Utiliser ensure_session_dict
-            session = ensure_session_dict(user_id)
-            password = session.get('batch_both_password', '')
-            
-            if password:
-                files = user_batches.get(user_id, [])
-                if files:
-                    file = await client.download_media(files[0]['file_id'], file_name=f"{get_user_temp_dir(user_id)}/temp.pdf")
-                    try:
-                        with pikepdf.open(file) as pdf:
-                            total_pages = len(pdf.pages)
-                        os.remove(file)
-                        await process_batch_both(client, query.message, user_id, password, str(total_pages))
-                        return
-                    except Exception as e:
-                        logger.error(f"Error getting last page: {e}")
-                        await safe_edit_message(query, "❌ Error reading PDF")
-                        return
-                else:
-                    await safe_edit_message(query, "❌ No files in batch")
-                    return
-            else:
-                logger.error(f"❌ batch_both_last - No password found for user {user_id}")
-                await query.answer("❌ Password not found. Please restart with /process", show_alert=True)
-                await safe_edit_message(query, "❌ Error: missing password.\n\nPlease use `/process` to start again.")
+            pw = ensure_session_dict(user_id).get('batch_both_password', '')
+            if not pw:
+                await safe_edit_message(query, "❌ Missing password. Re-run `/process` → The Both.")
                 return
-        
+            await safe_edit_message(query, "⏳ The Both (remove LAST page) running on all PDFs…")
+            await process_batch_both(client, query.message, user_id, pw, "last")
+            clear_processing_flag(user_id, source="batch_both_last", reason="queued")
+            return
+
         elif action == "batch_both_middle":
-            # FIX: Utiliser ensure_session_dict
-            session = ensure_session_dict(user_id)
-            password = session.get('batch_both_password', '')
-            
-            if password:
-                files = user_batches.get(user_id, [])
-                if files:
-                    file = await client.download_media(files[0]['file_id'], file_name=f"{get_user_temp_dir(user_id)}/temp.pdf")
-                    try:
-                        with pikepdf.open(file) as pdf:
-                            total_pages = len(pdf.pages)
-                        middle = total_pages // 2
-                        os.remove(file)
-                        await process_batch_both(client, query.message, user_id, password, str(middle))
-                        return
-                    except Exception as e:
-                        logger.error(f"Error getting middle page: {e}")
-                        await safe_edit_message(query, "❌ Error reading PDF")
-                        return
-                else:
-                    await safe_edit_message(query, "❌ No files in batch")
-                    return
-            else:
-                logger.error(f"❌ batch_both_middle - No password found for user {user_id}")
-                await query.answer("❌ Password not found. Please restart with /process", show_alert=True)
-                await safe_edit_message(query, "❌ Error: missing password.\n\nPlease use `/process` to start again.")
+            pw = ensure_session_dict(user_id).get('batch_both_password', '')
+            if not pw:
+                await safe_edit_message(query, "❌ Missing password. Re-run `/process` → The Both.")
                 return
-        
+            await safe_edit_message(query, "⏳ The Both (remove MIDDLE page) running on all PDFs…")
+            await process_batch_both(client, query.message, user_id, pw, "middle")
+            clear_processing_flag(user_id, source="batch_both_middle", reason="queued")
+            return
+
         elif action == "batch_both_manual":
-            # FIX: Utiliser ensure_session_dict et vérifier le password
-            session = ensure_session_dict(user_id)
-            password = session.get('batch_both_password', '')
-            
-            if password:
-                sessions[user_id]['awaiting_batch_both_pages'] = True
-                await safe_edit_message(query,
-                    "📝 **Manual page entry - Batch**\n\n"
-                    "Send me the pages to remove:\n"
-                    "• 1 → removes page 1\n"
-                    "• 1,3,5 → removes pages 1, 3 and 5\n"
-                    "• 1-5 → removes pages 1 to 5"
-                )
-                # Do not keep processing active while waiting for user input
-                clear_processing_flag(user_id, source="batch_both_manual", reason="awaiting_input")
+            pw = ensure_session_dict(user_id).get('batch_both_password', '')
+            if not pw:
+                await safe_edit_message(query, "❌ Missing password. Re-run `/process` → The Both.")
                 return
-            else:
-                logger.error(f"❌ batch_both_manual - No password found for user {user_id}")
-                await query.answer("❌ Password not found. Please restart with /process", show_alert=True)
-                await safe_edit_message(query, "❌ Error: missing password.\n\nPlease use `/process` to process again.")
-                return
+            sessions[user_id]['awaiting_batch_both_pages'] = True
+            await safe_edit_message(
+                query,
+                "📝 **Manual page entry – The Both (Batch)**\n"
+                "Send pages to remove (e.g. `1`, `1,3,5`, `1-5`) or `none`."
+            )
+            clear_processing_flag(user_id, source="batch_both_manual", reason="awaiting_input")
+            return
     
     # Gestion des paramètres
     if data == "settings":
@@ -2674,11 +2671,10 @@ async def button_callback(client, query: CallbackQuery):
     action, user_id = data.split(":")
     user_id = int(user_id)
     
-    # Rename file functionality
+    # Rename file functionality (clean version)
     if action == "rename_file":
         if user_id not in sessions:
             sessions[user_id] = {}
-        # S'assurer que la session contient les données nécessaires
         if 'file_id' not in sessions[user_id]:
             await query.edit_message_text("❌ No file in session. Send a PDF first.")
             clear_processing_flag(user_id, source="rename_file", reason="no_file")
@@ -3483,6 +3479,13 @@ async def handle_all_text(client, message: Message):
         await process_batch_both(client, message, user_id, password, pages_text)
         return
 
+    # Batch 'Remove Pages (all)' - manual pages entry
+    if session.get('awaiting_batch_pages'):
+        pages_text = message.text.strip()
+        session['awaiting_batch_pages'] = False
+        await process_batch_pages(client, message, user_id, pages_text)
+        return
+
     # Gestion username/hashtag (paramètre)
     if session.get('awaiting_username'):
         username = message.text.strip()
@@ -3770,6 +3773,10 @@ async def process_batch_unlock(client, message, user_id, password):
     
     logger.info(f"🔍 Start process_batch_unlock - User {user_id} - Time: {datetime.now()}")
     status = await create_or_edit_status(client, message, f"⏳ Processing {len(pdf_files)} PDF files...")
+    try:
+        await status.edit_text("⏳ Starting batch page removal…")
+    except Exception:
+        pass
     success_count = 0
     error_count = 0
     
@@ -3828,7 +3835,56 @@ async def process_batch_unlock(client, message, user_id, password):
         clear_processing_flag(user_id, source="batch_unlock", reason="completed")
 
 async def process_batch_pages(client, message, user_id, pages_text):
-    # ... (rest of the code remains the same)
+    if user_id not in user_batches:
+        user_batches[user_id] = []
+
+    files = user_batches[user_id]
+    pdf_files = [f for f in files if is_pdf_file(f['file_name'])]
+
+    if not pdf_files:
+        if hasattr(message, 'edit_message_text'):
+            await message.edit_message_text("❌ No PDF files in batch")
+        else:
+            await client.send_message(message.chat.id, "❌ No PDF files in batch")
+        clear_processing_flag(user_id, source="batch_pages", reason="no_pdfs")
+        return
+
+    # Parse pages
+    try:
+        pages_to_remove = set()
+        spec = (pages_text or '').strip()
+        if spec.lower() in {"none", "no", "skip", "0"}:
+            pages_to_remove = set()
+        elif spec.lower() == "first":
+            pages_to_remove = {1}
+        elif spec.lower() == "last":
+            # Will compute per-file below
+            pages_to_remove = {"__LAST__"}
+        elif spec.lower() == "middle":
+            # Will compute per-file below
+            pages_to_remove = {"__MIDDLE__"}
+        else:
+            for part in spec.replace(' ', '').split(','):
+                if not part:
+                    continue
+                if '-' in part:
+                    start, end = map(int, part.split('-'))
+                    pages_to_remove.update(range(start, end + 1))
+                else:
+                    pages_to_remove.add(int(part))
+    except Exception:
+        if hasattr(message, 'edit_message_text'):
+            await message.edit_message_text("❌ Invalid format. Use: 1,3,5 or 1-5")
+        else:
+            await client.send_message(message.chat.id, "❌ Invalid format. Use: 1,3,5 or 1-5")
+        clear_processing_flag(user_id, source="batch_pages", reason="invalid_pages_format")
+        return
+
+    session = ensure_session_dict(user_id)
+    logger.info(f"🔍 Start process_batch_pages - User {user_id} - Time: {datetime.now()}")
+    status = await create_or_edit_status(client, message, f"⏳ Processing {len(pdf_files)} PDF files...")
+    success_count = 0
+    error_count = 0
 
     try:
         for i, file_info in enumerate(pdf_files):
@@ -3843,7 +3899,16 @@ async def process_batch_pages(client, message, user_id, pages_text):
                     shutil.move(file, input_path)
                     
                     with pikepdf.open(input_path, allow_overwriting_input=True) as pdf:
-                        pages_to_keep = [p for i, p in enumerate(pdf.pages) if (i + 1) not in pages_to_remove]
+                        # Compute dynamic selections if needed
+                        effective_remove: set[int] = set()
+                        if "__LAST__" in pages_to_remove:
+                            effective_remove.add(len(pdf.pages))
+                        if "__MIDDLE__" in pages_to_remove:
+                            effective_remove.add(max(1, len(pdf.pages) // 2))
+                        # Add static ones
+                        effective_remove.update({p for p in pages_to_remove if isinstance(p, int)})
+
+                        pages_to_keep = [p for i, p in enumerate(pdf.pages) if (i + 1) not in effective_remove]
 
                         if not pages_to_keep:
                             error_count += 1
